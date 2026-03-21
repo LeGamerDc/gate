@@ -1,7 +1,6 @@
 package gate
 
 import (
-	"fmt"
 	"net"
 	"time"
 
@@ -15,23 +14,29 @@ var (
 )
 
 type ev struct {
-	c  *Config
-	en gnet.Engine
+	c     *Config
+	en    gnet.Engine
+	ready chan serverReady
 }
 
 func StartEventLoop(c *Config) error {
-	c.purge()
-	logging.SetDefaultLoggerAndFlusher(c.Logger, nil)
-	log = c.Logger
-	e := &ev{
-		c: c,
+	s, err := StartServer(c)
+	if err != nil {
+		return err
 	}
-	return gnet.Run(e, fmt.Sprintf("tcp://0.0.0.0:%d", c.Port),
-		gnet.WithNumEventLoop(c.LoopCount))
+	return s.Wait()
 }
 
 func (e *ev) OnBoot(en gnet.Engine) (action gnet.Action) {
 	e.en = en
+	if e.ready != nil {
+		addr, err := engineListenAddr(en)
+		e.ready <- serverReady{
+			engine: en,
+			addr:   addr,
+			err:    err,
+		}
+	}
 	return gnet.None
 }
 

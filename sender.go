@@ -6,7 +6,6 @@ import (
 	"math"
 	"slices"
 	"sync"
-	"time"
 
 	"github.com/panjf2000/gnet/v2"
 
@@ -19,11 +18,9 @@ var (
 		CompressThreshold: 1024,            // 1KB
 		MaxBufferSize:     2 * 1024 * 1024, // 2MB
 		MaxClusterSize:    32 * 1024,       // 32KB
-		DelaySendMs:       0,               // disabled
 	})
 
-	delayCall *delay[*sender]
-	enc       *zstd.Encoder
+	enc *zstd.Encoder
 )
 
 type sendMsg struct {
@@ -32,10 +29,9 @@ type sendMsg struct {
 }
 
 type SenderConfig struct {
-	CompressThreshold int   // 开启压缩阈值，<=0 表示从不压缩，单位 Byte
-	MaxBufferSize     int   // 最大待发送缓冲区大小，<=0 表示不限制，单位 Byte
-	MaxClusterSize    int   // 最大合并数据大小，<=0 表示不合并，单位 Byte
-	DelaySendMs       int64 // 延迟发送，用于更多地合并发送数据，减少系统调用，提高压缩率，<= 0 表示不开启，单位 ms
+	CompressThreshold int // 开启压缩阈值，<=0 表示从不压缩，单位 Byte
+	MaxBufferSize     int // 最大待发送缓冲区大小，<=0 表示不限制，单位 Byte
+	MaxClusterSize    int // 最大合并数据大小，<=0 表示不合并，单位 Byte
 }
 
 type senderBuilder struct {
@@ -166,12 +162,10 @@ func (s *sender) pushCompound(buf []sendMsg) {
 
 func (s *sender) pushSeparate(buf ...sendMsg) {
 	var (
-		conn               = s.conn.conn
-		rest               = math.MaxInt
-		flag, maskP, maskA byte
-		data               []byte
-		vb                 = make([][]byte, 0, min(2*len(buf), 64))
-		vc                 [][]byte
+		conn = s.conn.conn
+		rest = math.MaxInt
+		vb   = make([][]byte, 0, min(2*len(buf), 64))
+		vc   [][]byte
 	)
 	for sub := range slices.Chunk(buf, 32) {
 		if s.c.MaxBufferSize > 0 {
@@ -187,8 +181,12 @@ func (s *sender) pushSeparate(buf ...sendMsg) {
 				log.Warnf("client blocking, drop message %s", s.conn.Remote())
 				break
 			}
-			var header [4]byte
-			data, maskP, maskA = msg.data, msg.maskPermit, msg.maskAlready
+			var (
+				header [4]byte
+				data   = msg.data
+				maskP  = msg.maskPermit
+				flag   = msg.maskAlready
+			)
 			// 1. compress
 			if maskP&maskZ > 0 && s.c.CompressThreshold > 0 && len(data) > s.c.CompressThreshold {
 				compressed := mcache.Malloc(0, len(data))
@@ -202,7 +200,7 @@ func (s *sender) pushSeparate(buf ...sendMsg) {
 				flag |= maskE
 			}
 			n := encodeHeader(header[:], len(data))
-			header[0] |= flag | maskA
+			header[0] |= flag
 			vb = append(vb, header[:n])
 			vb = append(vb, data)
 			rest -= n + len(data)
@@ -225,17 +223,9 @@ func (s *sender) send(data []byte, maskP, maskA byte) error {
 	s.queue = append(s.queue, sendMsg{maskP, maskA, data})
 	if !s.triggered {
 		s.triggered = true
-		if s.c.DelaySendMs > 0 {
-			delayCall.Push(s, time.Now().UnixMilli()+s.c.DelaySendMs)
-		} else {
-			logErr(s.conn.conn.Wake(s.callback))
-		}
+		logErr(s.conn.conn.Wake(s.callback))
 	}
 	return nil
-}
-
-func (s *sender) Call() {
-	logErr(s.conn.conn.Wake(s.callback))
 }
 
 func (s *sender) Send(data []byte) error {
@@ -246,8 +236,11 @@ func (s *sender) SendNoEncrypt(data []byte) error {
 	return s.send(data, 0, 0)
 }
 
-func (s *sender) SendCompressed(data []byte) error {
-	return s.send(data, maskE, maskZ)
+func (s *sender) SendShared(data []byte, alreadyCompressed bool) error {
+	if alreadyCompressed {
+		return s.send(data, 0, maskZ)
+	}
+	return s.send(data, 0, 0)
 }
 
 // queuePool 复用 sender buffer queue
@@ -287,6 +280,4 @@ func init() {
 	enc, _ = zstd.NewWriter(nil, // wont fail
 		zstd.WithEncoderLevel(zstd.SpeedBetterCompression),
 		zstd.WithEncoderConcurrency(1))
-	delayCall = newDelay[*sender](100000)
-	go delayCall.Start()
 }

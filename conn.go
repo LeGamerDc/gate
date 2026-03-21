@@ -54,6 +54,7 @@ func (c *Conn) read() (data []byte, clean func(), ok bool) {
 	if buf, e = c.conn.Peek(2); e != nil {
 		return
 	}
+	// 接收侧协议只支持解帧和可选解密，client 不允许上行 z/c 标记。
 	size, m, _, _, en := parseHeader([2]byte(buf))
 	if m {
 		if buf, e = c.conn.Peek(4); e != nil {
@@ -79,7 +80,9 @@ func (c *Conn) read() (data []byte, clean func(), ok bool) {
 	return data, clean, true
 }
 
-// AsyncDo 阻塞connection读新消息，直到f完成。对于一些有限制串行的消息有用
+// AsyncDo 阻塞 connection 继续处理消息，直到 f 完成。
+// 对于一些有限制串行的消息有用。阻塞期间数据仍保留在 gnet 的连接缓冲区中，不会丢失；
+// f 完成后会通过 Wake 继续消费这些消息。
 func (c *Conn) AsyncDo(f func()) {
 	c.blocking.Store(true)
 	go func() {
@@ -103,10 +106,10 @@ func (c *Conn) SendNoEncrypt(data []byte) error {
 	return c.sender.SendNoEncrypt(data)
 }
 
-// SendCompressed 不启用压缩，有一些消息会发给多个client，可以提前压缩
-// 避免每个connection压缩一次
-func (c *Conn) SendCompressed(data []byte) error {
-	return c.sender.SendCompressed(data)
+// SendShared 发送共享只读数据，不允许后续压缩、合包或加密。
+// alreadyCompressed=true 时仅携带压缩标记，gate 不会改写 data。
+func (c *Conn) SendShared(data []byte, alreadyCompressed bool) error {
+	return c.sender.SendShared(data, alreadyCompressed)
 }
 
 func (c *Conn) UpdateCipher(cipher Cipher) {
