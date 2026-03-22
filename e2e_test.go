@@ -70,6 +70,80 @@ func TestE2EEncryptedCompressedRoundTrip(t *testing.T) {
 	}
 }
 
+func TestE2ESendCanUseBorrowedRawWithoutManualCopy(t *testing.T) {
+	srv := startTestServer(t, &Config{
+		CHB: testHandlerBuilder{build: func(conn *Conn) ConnHandler {
+			return &testConnHandler{
+				conn: conn,
+				handle: func(conn *Conn, raw []byte) {
+					want := append([]byte(nil), raw...)
+					_ = conn.SendNoEncrypt(raw)
+					if len(raw) > 0 {
+						raw[0] ^= 0xff
+					}
+					_ = conn.SendNoEncrypt(want)
+				},
+			}
+		}},
+		SB: NewSenderBuilder(&SenderConfig{
+			CompressThreshold: 0,
+			MaxBufferSize:     2 * 1024 * 1024,
+			MaxClusterSize:    0,
+		}),
+	})
+
+	client, handler := startTestClient(t, srv.Addr(), nil)
+	msg := []byte("borrowed buffer")
+	if err := client.SendNoEncrypt(msg); err != nil {
+		t.Fatal(err)
+	}
+
+	got1 := waitMessage(t, handler.msgCh)
+	got2 := waitMessage(t, handler.msgCh)
+	if !bytes.Equal(got1, msg) {
+		t.Fatalf("unexpected first copied payload: %q", got1)
+	}
+	if !bytes.Equal(got2, msg) {
+		t.Fatalf("unexpected second copied payload: %q", got2)
+	}
+}
+
+func TestE2ESendEncryptedLeavesCallerBufferUntouched(t *testing.T) {
+	cipher := xorCipher{key: 0x2a}
+	payload := []byte("shared caller payload")
+	want := append([]byte(nil), payload...)
+
+	srv := startTestServer(t, &Config{
+		CHB: testHandlerBuilder{build: func(conn *Conn) ConnHandler {
+			conn.UpdateCipher(cipher)
+			return &testConnHandler{
+				conn: conn,
+				handle: func(conn *Conn, raw []byte) {
+					_ = conn.Send(payload)
+				},
+			}
+		}},
+		SB: NewSenderBuilder(&SenderConfig{
+			CompressThreshold: 0,
+			MaxBufferSize:     2 * 1024 * 1024,
+			MaxClusterSize:    0,
+		}),
+	})
+
+	client, handler := startTestClient(t, srv.Addr(), cipher)
+	if err := client.SendNoEncrypt([]byte("trigger")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := waitMessage(t, handler.msgCh)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("unexpected encrypted payload: %q", got)
+	}
+	if !bytes.Equal(payload, want) {
+		t.Fatal("Send mutated caller-owned payload")
+	}
+}
+
 func TestE2ESendSharedSkipsEncryptAndLeavesSharedBufferUntouched(t *testing.T) {
 	cipher := xorCipher{key: 0x44}
 	shared := []byte("shared payload")
@@ -211,6 +285,69 @@ func TestE2EAsyncDoPreservesOrder(t *testing.T) {
 	}
 	if !bytes.Equal(got2, []byte("second")) {
 		t.Fatalf("unexpected second message: %q", got2)
+	}
+}
+
+func TestE2EAsyncDoReentrantPreservesOrder(t *testing.T) {
+	fastReady := make(chan struct{})
+	slowReady := make(chan struct{})
+
+	srv := startTestServer(t, &Config{
+		CHB: testHandlerBuilder{build: func(conn *Conn) ConnHandler {
+			return &testConnHandler{
+				conn: conn,
+				handle: func(conn *Conn, raw []byte) {
+					msg := append([]byte(nil), raw...)
+					if bytes.Equal(msg, []byte("first")) {
+						conn.AsyncDo(func() {
+							<-fastReady
+							_ = conn.SendNoEncrypt([]byte("fast"))
+						})
+						conn.AsyncDo(func() {
+							<-slowReady
+							_ = conn.SendNoEncrypt([]byte("slow"))
+						})
+						return
+					}
+					_ = conn.SendNoEncrypt(msg)
+				},
+			}
+		}},
+		SB: NewSenderBuilder(&SenderConfig{
+			CompressThreshold: 0,
+			MaxBufferSize:     2 * 1024 * 1024,
+			MaxClusterSize:    0,
+		}),
+	})
+
+	client, handler := startTestClient(t, srv.Addr(), nil)
+	if err := client.SendNoEncrypt([]byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SendNoEncrypt([]byte("second")); err != nil {
+		t.Fatal(err)
+	}
+
+	close(fastReady)
+	got1 := waitMessage(t, handler.msgCh)
+	if !bytes.Equal(got1, []byte("fast")) {
+		t.Fatalf("unexpected first reentrant AsyncDo message: %q", got1)
+	}
+
+	select {
+	case msg := <-handler.msgCh:
+		t.Fatalf("unexpected message before slow AsyncDo completed: %q", msg)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(slowReady)
+	got2 := waitMessage(t, handler.msgCh)
+	got3 := waitMessage(t, handler.msgCh)
+	if !bytes.Equal(got2, []byte("slow")) {
+		t.Fatalf("unexpected second reentrant AsyncDo message: %q", got2)
+	}
+	if !bytes.Equal(got3, []byte("second")) {
+		t.Fatalf("unexpected third reentrant AsyncDo message: %q", got3)
 	}
 }
 

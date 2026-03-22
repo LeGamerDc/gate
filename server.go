@@ -33,7 +33,9 @@ type Server struct {
 // StartServer starts a gate server in the background and returns once the
 // listener is ready to accept connections.
 func StartServer(c *Config) (*Server, error) {
-	c.purge()
+	if err := c.purge(); err != nil {
+		return nil, err
+	}
 	logging.SetDefaultLoggerAndFlusher(c.Logger, nil)
 	log = c.Logger
 

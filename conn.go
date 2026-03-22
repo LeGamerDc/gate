@@ -19,11 +19,12 @@ type Conn struct {
 
 	remoteIp   net.IP
 	remotePort int
+	outbound   outboundWriter
 	sender     SenderI
 	cipher     Cipher
 	handler    ConnHandler
 
-	blocking atomic.Bool
+	blocking atomic.Int32
 }
 
 func (c *Conn) onTraffic() {
@@ -33,7 +34,7 @@ func (c *Conn) onTraffic() {
 		ok    = true
 	)
 	for ok {
-		if c.blocking.Load() {
+		if c.isBlocking() {
 			break
 		}
 		if msg, clean, ok = c.read(); ok {
@@ -80,15 +81,20 @@ func (c *Conn) read() (data []byte, clean func(), ok bool) {
 	return data, clean, true
 }
 
-// AsyncDo 阻塞 connection 继续处理消息，直到 f 完成。
+func (c *Conn) isBlocking() bool {
+	return c.blocking.Load() > 0
+}
+
+// AsyncDo 阻塞 connection 继续处理消息，直到最后一个挂起的 f 完成。
 // 对于一些有限制串行的消息有用。阻塞期间数据仍保留在 gnet 的连接缓冲区中，不会丢失；
-// f 完成后会通过 Wake 继续消费这些消息。
+// 支持重入，只有最外层未完成的 AsyncDo 结束后才会通过 Wake 继续消费这些消息。
 func (c *Conn) AsyncDo(f func()) {
-	c.blocking.Store(true)
+	c.blocking.Add(1)
 	go func() {
 		defer func() {
-			c.blocking.Store(false)
-			logErr(c.conn.Wake(nil))
+			if c.blocking.Add(-1) == 0 {
+				logErr(c.conn.Wake(nil))
+			}
 			if r := recover(); r != nil {
 				fmt.Printf("[gate] AsyncDo panic: %v\n%s\n", r, debug.Stack())
 			}
@@ -101,12 +107,13 @@ func (c *Conn) Send(data []byte) error {
 	return c.sender.Send(data)
 }
 
-// SendNoEncrypt 不启用加密
+// SendNoEncrypt 发送明文单帧消息，并在入队时复制 data。
 func (c *Conn) SendNoEncrypt(data []byte) error {
 	return c.sender.SendNoEncrypt(data)
 }
 
 // SendShared 发送共享只读数据，不允许后续压缩、合包或加密。
+// data 不会被复制，调用方必须保证它在发送完成前保持只读。
 // alreadyCompressed=true 时仅携带压缩标记，gate 不会改写 data。
 func (c *Conn) SendShared(data []byte, alreadyCompressed bool) error {
 	return c.sender.SendShared(data, alreadyCompressed)

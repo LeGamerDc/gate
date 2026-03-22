@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/gobwas/ws"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -25,6 +26,16 @@ func (h *benchClientHandler) OnMessage(_ *Client, msg []byte) {
 }
 
 func (h *benchClientHandler) OnClose(*Client, error) {}
+
+type benchConnHandler struct {
+	total int
+}
+
+func (h *benchConnHandler) Handle(raw []byte) {
+	h.total += len(raw)
+}
+
+func (h *benchConnHandler) Close() {}
 
 func BenchmarkEncodeHeader(b *testing.B) {
 	for _, size := range []int{128, 8 * 1024} {
@@ -170,9 +181,75 @@ func BenchmarkClientHandleFrame(b *testing.B) {
 	}
 }
 
+func BenchmarkWebSocketDecodeMessages(b *testing.B) {
+	for _, tc := range []struct {
+		name   string
+		frames [][]byte
+	}{
+		{
+			name: "binary",
+			frames: [][]byte{
+				buildFrame(bytes.Repeat([]byte("w"), 1024), 0),
+			},
+		},
+		{
+			name: "fragmented_binary",
+			frames: [][]byte{
+				buildFrame(bytes.Repeat([]byte("f"), 1024), 0)[:128],
+				buildFrame(bytes.Repeat([]byte("f"), 1024), 0)[128:],
+			},
+		},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			wire := buildWebSocketWireFrames(b, tc.frames...)
+			handler := &benchConnHandler{}
+			state := &wsConnState{conn: &Conn{handler: handler}}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				handler.total = 0
+				state.buf.Reset()
+				state.gateBuf.Reset()
+				state.fragmentBuf.reset()
+				_, _ = state.buf.Write(wire)
+				if err := state.decodeMessages(); err != nil {
+					b.Fatal(err)
+				}
+				benchByteSink += handler.total + state.gateBuf.Len()
+			}
+		})
+	}
+}
+
 func headerBenchmarkName(size int) string {
 	if size < moreHeaderSize {
 		return "short_header"
 	}
 	return "extended_header"
+}
+
+func buildWebSocketWireFrames(b *testing.B, frames ...[]byte) []byte {
+	b.Helper()
+
+	var wire bytes.Buffer
+	for i, payload := range frames {
+		op := ws.OpBinary
+		fin := true
+		if len(frames) > 1 {
+			if i == 0 {
+				fin = false
+			} else {
+				op = ws.OpContinuation
+			}
+			if i != len(frames)-1 {
+				fin = false
+			}
+		}
+		frame := ws.MaskFrame(ws.NewFrame(op, fin, payload))
+		if err := ws.WriteFrame(&wire, frame); err != nil {
+			b.Fatal(err)
+		}
+	}
+	return wire.Bytes()
 }

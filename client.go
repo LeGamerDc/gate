@@ -90,9 +90,21 @@ func DialContext(ctx context.Context, cfg *ClientConfig) (*Client, error) {
 		return nil, err
 	}
 
-	dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+	client, err := newClientWithConn(conn, cfg)
 	if err != nil {
 		_ = conn.Close()
+		return nil, err
+	}
+	return client, nil
+}
+
+func newClientWithConn(conn net.Conn, cfg *ClientConfig) (*Client, error) {
+	if cfg == nil {
+		return nil, errors.New("client config must set")
+	}
+
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+	if err != nil {
 		return nil, err
 	}
 

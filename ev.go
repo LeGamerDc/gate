@@ -48,19 +48,40 @@ func (e *ev) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 		remoteIp:   c.RemoteAddr().(*net.TCPAddr).IP,
 		remotePort: c.RemoteAddr().(*net.TCPAddr).Port,
 	}
+	if e.c.Transport == ServerTransportWebSocket {
+		conn.outbound = &wsOutbound{conn: c}
+	}
 	conn.sender = e.c.SB.Build(conn)
 	conn.handler = e.c.CHB.Build(conn)
+	if e.c.Transport == ServerTransportWebSocket {
+		c.SetContext(newWSConnState(
+			conn,
+			e.c.WebSocketPath,
+			e.c.MaxWebSocketHandshakeBytes,
+			e.c.MaxWebSocketBufferedBytes,
+		))
+		return nil, gnet.None
+	}
 	c.SetContext(conn)
 	return nil, gnet.None
 }
 
 func (e *ev) OnClose(c gnet.Conn, _ error) (action gnet.Action) {
+	if e.c.Transport == ServerTransportWebSocket {
+		state := c.Context().(*wsConnState)
+		state.conn.handler.Close()
+		return gnet.None
+	}
 	conn := c.Context().(*Conn)
 	conn.handler.Close()
 	return gnet.None
 }
 
 func (e *ev) OnTraffic(c gnet.Conn) (action gnet.Action) {
+	if e.c.Transport == ServerTransportWebSocket {
+		state := c.Context().(*wsConnState)
+		return state.onTraffic()
+	}
 	conn := c.Context().(*Conn)
 	conn.onTraffic()
 	return gnet.None

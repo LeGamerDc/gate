@@ -26,6 +26,7 @@ var (
 type sendMsg struct {
 	maskPermit, maskAlready byte
 	data                    []byte
+	owned                   bool
 }
 
 type SenderConfig struct {
@@ -77,7 +78,10 @@ func (s *sender) callback(_ gnet.Conn, e error) (_ error) {
 		if len(buf) == 0 {
 			return
 		}
-		defer putQ(buf)
+		defer func() {
+			releaseSendMsgs(buf)
+			putQ(buf)
+		}()
 		s.pushTcp(buf)
 	}
 	return
@@ -156,8 +160,7 @@ func (s *sender) pushCompound(buf []sendMsg) {
 	}
 	data[0] |= flag
 	// 4. send
-	_, e := s.conn.conn.Write(data)
-	logErr(e)
+	logErr(s.conn.writeOutbound(data))
 }
 
 func (s *sender) pushSeparate(buf ...sendMsg) {
@@ -205,22 +208,31 @@ func (s *sender) pushSeparate(buf ...sendMsg) {
 			vb = append(vb, data)
 			rest -= n + len(data)
 		}
-		_, e := conn.Writev(vb)
-		logErr(e)
+		logErr(s.conn.writevOutbound(vb))
 		for _, c := range vc {
 			mcache.Free(c)
 		}
 	}
 }
 
-func (s *sender) send(data []byte, maskP, maskA byte) error {
+func (s *sender) send(data []byte, maskP, maskA byte, shared bool) error {
 	if len(data) > maxMessageSize {
 		return ErrMaxMessageSize
 	}
 
+	msg := sendMsg{
+		maskPermit:  maskP,
+		maskAlready: maskA,
+		data:        data,
+	}
+	if !shared && len(data) > 0 {
+		msg.data = cloneSendData(data)
+		msg.owned = true
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.queue = append(s.queue, sendMsg{maskP, maskA, data})
+	s.queue = append(s.queue, msg)
 	if !s.triggered {
 		s.triggered = true
 		logErr(s.conn.conn.Wake(s.callback))
@@ -229,18 +241,18 @@ func (s *sender) send(data []byte, maskP, maskA byte) error {
 }
 
 func (s *sender) Send(data []byte) error {
-	return s.send(data, maskZ|maskC|maskE, 0)
+	return s.send(data, maskZ|maskC|maskE, 0, false)
 }
 
 func (s *sender) SendNoEncrypt(data []byte) error {
-	return s.send(data, 0, 0)
+	return s.send(data, 0, 0, false)
 }
 
 func (s *sender) SendShared(data []byte, alreadyCompressed bool) error {
 	if alreadyCompressed {
-		return s.send(data, 0, maskZ)
+		return s.send(data, 0, maskZ, true)
 	}
-	return s.send(data, 0, 0)
+	return s.send(data, 0, 0, true)
 }
 
 // queuePool 复用 sender buffer queue
@@ -261,10 +273,26 @@ func putQ(q []sendMsg) {
 	queuePool.Put(q)
 }
 
+func cloneSendData(data []byte) []byte {
+	cloned := mcache.Malloc(len(data))
+	copy(cloned, data)
+	return cloned
+}
+
+func releaseSendMsgs(q []sendMsg) {
+	for _, msg := range q {
+		if msg.owned {
+			mcache.Free(msg.data)
+		}
+	}
+}
+
 // byteBufferPool 复用 bytesBuffer
 var byteBufferPool = sync.Pool{New: func() interface{} {
 	return bytes.NewBuffer(make([]byte, 0, 2*1024))
 }}
+
+const maxReusableBufferCap = 256 * 1024
 
 func getBuffer() *bytes.Buffer {
 	b := byteBufferPool.Get().(*bytes.Buffer)
@@ -273,6 +301,10 @@ func getBuffer() *bytes.Buffer {
 }
 
 func putBuffer(b *bytes.Buffer) {
+	if b.Cap() > maxReusableBufferCap {
+		return
+	}
+	b.Reset()
 	byteBufferPool.Put(b)
 }
 

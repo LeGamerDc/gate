@@ -3,6 +3,7 @@
 `gate` 是一个基于 `gnet` 的轻量 TCP 网关库。它当前做的事情不是业务协议本身，而是把连接管理、拆包、可选加密、发送侧压缩/合包这些通用能力抽成一个可复用组件，让业务只需要实现自己的 `ConnHandler`。
 
 仓库同时带了一套 `benchmark` 示例，用来验证吞吐、延迟、压缩率和合包效果。
+现在这套 benchmark 逻辑也已经抽成可复用的 `benchmark/runner`，可以直接被自动化测试调用，而不只是手动 `go run`。
 
 ## 当前项目做了什么
 
@@ -27,7 +28,7 @@
 - 使用 `gnet.Run` 启动 `tcp://0.0.0.0:<port>` 监听
 - 通过 `LoopCount` 控制事件循环数量
 
-对应实现见 [ev.go](/Users/dongcheng/Project/legamerdc/gate/ev.go)。
+对应实现见 [ev.go](ev.go)。
 
 ### 2. 连接生命周期
 
@@ -41,7 +42,7 @@
 
 连接关闭时，会调用业务处理器的 `Close()` 做清理。
 
-这部分在 [ev.go](/Users/dongcheng/Project/legamerdc/gate/ev.go) 和 [conn.go](/Users/dongcheng/Project/legamerdc/gate/conn.go)。
+这部分在 [ev.go](ev.go) 和 [conn.go](conn.go)。
 
 ### 3. 收包路径
 
@@ -58,9 +59,10 @@
 
 - 当前接收路径内置支持的是“解帧 + 可选解密”
 - 当前协议不允许 client 上行压缩消息或 compound message；也就是说接收侧不处理 `z/c` 标记
-- `Handle(raw []byte)` 拿到的是连接读缓冲上的借用数据，如需跨 `Handle` 生命周期使用，业务层需要自行拷贝
+- `Handle(raw []byte)` 拿到的是连接读缓冲上的借用数据；但它可以直接传给 `Conn.Send/SendNoEncrypt`，因为这两个接口会在入队时复制数据
+- 如果要跨 `Handle` 生命周期持有 payload，或者要传给 `Conn.SendShared`，业务层仍然需要自行拷贝
 
-对应实现见 [conn.go](/Users/dongcheng/Project/legamerdc/gate/conn.go) 和 [header.go](/Users/dongcheng/Project/legamerdc/gate/header.go)。
+对应实现见 [conn.go](conn.go) 和 [header.go](header.go)。
 
 ### 4. 发包路径
 
@@ -68,9 +70,9 @@
 
 业务代码调用：
 
-- `Conn.Send(data)`：允许自动压缩、合包、加密
-- `Conn.SendNoEncrypt(data)`：直接发送，不压缩、不加密
-- `Conn.SendShared(data, alreadyCompressed)`：发送共享只读数据，`gate` 只负责挂消息头，不会再压缩、合包或加密这块 payload
+- `Conn.Send(data)`：复制 `data` 后再入队，允许自动压缩、合包、加密
+- `Conn.SendNoEncrypt(data)`：复制 `data` 后直接发送，不压缩、不加密
+- `Conn.SendShared(data, alreadyCompressed)`：零拷贝发送共享只读数据，`gate` 只负责挂消息头，不会再压缩、合包或加密这块 payload
 
 内部流程如下：
 
@@ -83,7 +85,7 @@
    - 对 payload 做加密
 5. 如果连接的 `OutboundBuffered()` 超过 `MaxBufferSize`，会停止继续发送并记录日志，避免慢连接无限堆积。
 
-对应实现主要在 [sender.go](/Users/dongcheng/Project/legamerdc/gate/sender.go)。
+对应实现主要在 [sender.go](sender.go)。
 
 ### 5. 为什么能减少系统调用和带宽
 
@@ -115,7 +117,7 @@ conn.AsyncDo(func() {
 
 ## 消息头协议
 
-消息头在 [header.go](/Users/dongcheng/Project/legamerdc/gate/header.go)。
+消息头在 [header.go](header.go)。
 
 ### 基础格式
 
@@ -142,19 +144,24 @@ conn.AsyncDo(func() {
 
 ### `Config`
 
-见 [config.go](/Users/dongcheng/Project/legamerdc/gate/config.go)。
+见 [config.go](config.go)。
 
 | 字段 | 说明 |
 | --- | --- |
 | `LoopCount` | 事件循环数量，最终会被限制在 `[1, runtime.NumCPU()]` |
+| `Addr` | 监听地址；为空时回退到 `0.0.0.0:<Port>` |
 | `Port` | 监听端口 |
+| `Transport` | 传输封装；默认 TCP，也可以切到 WebSocket |
+| `WebSocketPath` | WebSocket 握手路径，默认 `/` |
+| `MaxWebSocketHandshakeBytes` | WebSocket 握手阶段允许缓冲的最大字节数，默认 `16KB` |
+| `MaxWebSocketBufferedBytes` | WebSocket 单连接允许缓冲的最大原始/解帧字节数，默认 `32MB + 64KB` |
 | `CHB` | `ConnHandlerBuilder`，负责为每个连接创建业务 handler |
 | `SB` | `SenderBuilder`，负责为每个连接创建发送器 |
 | `Logger` | `gate` 和 `gnet` 共用的 logger |
 
 ### `SenderConfig`
 
-见 [sender.go](/Users/dongcheng/Project/legamerdc/gate/sender.go)。
+见 [sender.go](sender.go)。
 
 | 字段 | 说明 |
 | --- | --- |
@@ -170,7 +177,7 @@ conn.AsyncDo(func() {
 
 ### 业务接口
 
-见 [i.go](/Users/dongcheng/Project/legamerdc/gate/i.go)。
+见 [i.go](i.go)。
 
 ```go
 type ConnHandler interface {
@@ -271,6 +278,7 @@ go run ./benchmark/server \
 
 - 启动多个 TCP 客户端并持续发送请求
 - 校验 server 回包内容
+- CLI 本身只是 `benchmark/runner` 的薄封装，方便脚本和测试复用
 - 每秒打印一组统计信息：
   - `tx/rx msg/s`
   - `raw MiB/s`
@@ -304,6 +312,12 @@ go run ./benchmark/client \
 
 ```bash
 go test -run '^$' -bench . -benchmem
+```
+
+另外，`benchmark/runner` 现在带了短时 E2E 自动测试，直接包含在：
+
+```bash
+go test ./...
 ```
 
 ## 当前实现边界
