@@ -12,7 +12,7 @@
 
 ```
 业务 goroutine ──Send()──> 连接级队列 ──首次入队时 Wake()──┐
-                                                          ↓
+                                                       ↓
                                 event loop 线程：整批取出
                                     → pushSeparate  (writev 批量写)
                                     → pushCompound  (多条拼包 → 可选压缩 → 单帧)
@@ -115,12 +115,28 @@ go test -run '^$' -fuzz FuzzCodec
 | `CompressThreshold` | 压缩阈值，`<=0` 关闭压缩。独立帧按 payload 判定，合并帧按整批字节数判定 |
 | `MaxBufferSize` | 单连接积压上限，`<=0` 不限制 |
 | `MaxClusterSize` | 单个合并帧上限，`<=0` 关闭合并 |
+| `CompressLevel` | 压缩等级，零值保持历史默认。它同时决定 zstd encoder 池的常驻内存 |
 
 **合并与压缩是相互独立的开关。** 关掉压缩不会连带关掉合并——大量小消息正是「该合包但不值得压缩」的典型场景，合包本身就能省下系统调用和小 TCP 段。
 
 `MaxBufferSize` 同时约束两处：sender 内部尚未 flush 的队列（超出时 `Send` 返回 `ErrSendQueueFull`），以及底层连接的出站缓冲（超出时**关闭连接**而不是丢消息——从一条有状态的帧流中间抽掉几条，只会让对端状态机静默错乱，业务层什么都察觉不到）。
 
 默认 `DefaultSenderBuilder`：压缩阈值 1KB、最大缓冲 2MB、最大合包 32KB。
+
+#### 压缩等级与内存
+
+zstd 在第一次压缩时会按并发度（`GOMAXPROCS`）造出对应数量的 encoder，每个 encoder 自带一整套固定大小的哈希表。10 核机器实测（首次 `EncodeAll` 之后的堆增量 ÷ 并发度）：
+
+| `CompressLevel` | 每 encoder | GOMAXPROCS=10 合计 |
+| --- | --- | --- |
+| `CompressFastest` | 约 0.27 MB | 约 3 MB |
+| `CompressBalanced` | 约 1.32 MB | 约 13 MB |
+| `CompressBetter`（零值） | 约 4.27 MB | 约 60 MB |
+| `CompressBest` | 更高 | 更高 |
+
+encoder 按等级在进程内共享，所以多个 `SenderBuilder` 用同一等级只付一份；从不压缩的 gate 一分钱都不付（zstd 是懒初始化的）。
+
+同一份「游戏协议 batch」样本上 `CompressFastest` 比 `CompressBetter` 快 24% 且压缩率一样（`BenchmarkZstdLevel`）。真实数据上 `Better` 通常确实更小，所以默认值没有变；对 CPU 或常驻内存敏感的话先试 `CompressFastest`。
 
 ### 业务接口
 
@@ -168,6 +184,14 @@ conn.AsyncDo(func() {
 `AsyncDo` 会暂停该连接继续读后续消息，在新 goroutine 中执行，结束后唤醒连接继续消费。数据仍保留在 gnet 的连接缓冲区中，不会丢失；支持重入。
 
 **只应在 `Handle` 内部调用**——从其他 goroutine 调用时「单连接内串行」的保证不成立，因为事件循环可能已经越过了阻塞检查。
+
+> 阻塞期间入站缓冲有上限：`MaxMessageSize + 64KB`，超过就关连接。挂起时 gate 一个字节都不消费，而 gnet 会继续把新到的数据追加进连接缓冲——没有上限的话，一个在慢速 `AsyncDo` 期间持续灌数据的客户端可以把单条连接的内存一路撑下去。如果业务确实需要在长时间 `AsyncDo` 期间容纳大量在途数据，把 `MaxMessageSize` 调大。
+
+### 关闭语义
+
+`conn.Close()` 之后，**同一批里剩下的消息不会再投递给 handler**。一个 TCP 读事件（或一个 WebSocket 二进制消息）里可以塞进多条消息，「第一条鉴权失败就关连接」必须真的能挡住后面那几条，否则把 `[伪造的登录包, 想执行的命令]` 拼在一个包里发出来就能绕过判定。
+
+反过来，**已经入队的出站消息仍然会被刷出去**：`Close()` 只停入站投递，不关出站闸口。所以「回一条拒绝消息，然后关连接」是可靠的。
 
 ### WebSocket 握手信息
 
@@ -258,17 +282,106 @@ go test -run '^$' -bench . -benchmem
 go test -run '^$' -fuzz FuzzCodec -fuzztime 60s
 ```
 
+`perf_bench_test.go` 装的是整条链路级别的基准（`ConnOnTraffic` / `WSOnTraffic` / `SenderSend` / `ClientEncodeOutbound`），`perf_test.go` 里每条用例都对应一处性能改动，用来钉住「优化没有改变可观察行为」。
+
+### 热路径的分配情况
+
+稳态下这几条路径都是 **0 分配**（`-benchmem` 可验证）：
+
+- TCP 入站：`Peek` → `codec.parse` → `deliver` → handler → `Discard`
+- WebSocket 入站：帧头解析、去掩码、内层 gate 帧解析与投递
+- 出站 flush：`pushSeparate`（含 writev 的 iovec 与 header 暂存）与 `pushCompound`
+- `Send` 入队：只有 `mcache` 那次借用，且走的是池
+
+客户端每条出站消息 1 次分配（帧缓冲本身）。
+
+跨调用的暂存空间一律**按事件循环池化**，不挂成连接级字段：`separateScratch`（sender 的 iovec + header）和 `wsScratch`（WebSocket 帧头 + iovec）都只在一次 flush 期间有用，而所有出站写都发生在连接自己的事件循环上且中途不让出，因此池里同时在外的对象数等于事件循环数，不随连接数增长。挂成连接级字段的话，十万连接光这两块就要白占约 300MB。
+
+### 这些优化在什么场景下才看得见
+
+`benchmark/runner` 那套 loopback 端到端基准**量不出**上面这些改动：交替跑 6 轮 A/B，四个场景的差值都在 ±1% 以内，而运行间离散度本身有 3.5~5%。
+
+原因不是优化没效果，而是那个 harness 根本不在 CPU 上。对它做 CPU profile：
+
+```
+92.85%  syscall.rawsyscalln
+ 3.86%  syscall.RawSyscall
+ 0.99%  runtime.kevent
+```
+
+gate 自身热路径的**平坦**耗时是 0%——`sender.pushSeparate` 的 3.86% 累计耗时全部是它内部那一次 `writev`，`Conn.onTraffic` 的 0.57% 全部是读。客户端和服务端跑在同一个进程、同样 10 个核上，时间几乎全花在系统调用上。
+
+所以这些改动的收益出现在**系统调用不再是瓶颈**的地方：
+
+- 单条 epoll 事件携带多条消息时（入站每消息固定成本从 31ns 降到 8ns）
+- CPU 受限的容器里（gate 少占的那部分 CPU 直接还给业务逻辑）
+- 海量连接下的常驻内存（暂存空间从按连接改成按事件循环，见上）
+- GC 压力（出站路径零分配意味着不再向堆里灌垃圾）
+
+反过来说：如果你的网关就是 syscall-bound 的，别指望这些改动能提高吞吐——该去调的是批量大小、`LoopCount` 和内核参数。
+
+### 一个关于取舍的说明
+
+活跃时间（`IdleTimeout` 的判据）是**每轮事件**刷新一次，而不是每条消息一次：`time.Now()` 要同时取墙上时钟和单调时钟，实测 31ns，而整条 TCP 入站路径处理一条消息本来只要 31ns。语义没有变——仍然只有真正交付了完整消息才算活跃，只是精度从「每条消息」降到「每次事件」，而 `IdleTimeout` 的量级是秒。
+
 ## 当前边界
 
 - 没有内置上层协议编解码，业务拿到的是 `[]byte`
 - 没有内置鉴权、路由、心跳、连接注册或房间广播语义
 - 接收侧协议不接受 client 上行压缩消息或 compound message（会直接断开）
 - 不支持 TLS / wss，需要前置代理终结
+- WebSocket 本地主动关闭（业务调 `Close`、空闲回收、背压、协议错误）不发 close 帧，直接关 TCP，所以对端看到的是 1006 abnormal closure 而不是状态码。收到对端的 close 帧时会正常回一个 close 完成握手。
+- `Cipher.Encrypt/Decrypt` 是唯一没有 recover 保护的业务回调（`i.go` 要求它 must not panic）。它在入站解密和出站加密的热路径上被逐帧调用，加一层 recover 的代价不值得——但这也意味着一个会 panic 的 Cipher 实现能打死进程。
 - 广播场景目前仍是逐连接编码；一份 payload 编码一次再分发给 N 个连接尚未实现（注意它与逐连接加密在根本上不兼容）
+
+## 测试工程
+
+测试按**被测能力**组织，而不是按写它的那次改动组织（此前是一批 `*_audit_test.go`，
+文件名记录的是"这批测试是哪次审查写的"，找不到东西也没地方放新用例）。分五层：
+
+| 层 | 文件 | 覆盖什么 |
+| --- | --- | --- |
+| harness | `testutil_test.go` | 共享的起 server / 连 client / logger / handler |
+| 协议单元 | `codec_test.go` `websocket_frame_test.go` `wscontrol_test.go` | 纯函数：头编解码、codec 策略、WS 帧头与控制帧 |
+| 组件流程 | `conn_close_test.go` `wsstate_test.go` `inbound_bound_test.go` `sender_test.go` `sender_writefail_test.go` `server_conn_test.go` `client_test.go` `client_protocol_test.go` | 单个组件的状态机，用可控假连接驱动 |
+| 端到端流程 | `flow_roundtrip_test.go` `flow_lifecycle_test.go` `flow_matrix_test.go` `flow_limits_test.go` `flow_panic_test.go` `flow_failure_test.go` `flow_concurrent_test.go` `flow_handshake_test.go` `websocket_handshake_test.go` `websocket_e2e_test.go` | 真实 socket，两种传输跑同一份断言 |
+| 性质与 fuzz | `property_test.go` `fuzz_test.go` | 对生成的输入断言不变式 |
+| 性能护栏 | `perf_test.go` `perf_bench_test.go` `bench_test.go` | 钉住热路径的分配数与结构体大小 |
+
+几条值得说明的设计：
+
+**同一份用例在两种传输上各跑一遍。** TCP 和 WebSocket 是两套完全独立的入站状态机
+（`conn.onTraffic` 与 `wsConnState.onTraffic`），却承诺对业务层呈现相同语义。
+`flow_matrix_test.go` 里的 `transportCase` 把"起 server + 连 client"抽象掉，
+让一致性成为持续被验证的东西，而不是一句注释。
+
+**尺寸边界按各自协议的切换点取，而不是按业务长度取。** WS 帧头的宽度切换点是按
+**WS 载荷**算的，而 WS 载荷 = gate header + 业务长度，中间差 2 或 4 字节。所以
+覆盖 WS 的 126 边界要用业务长度 123/124，覆盖 65536 边界要用 65531/65532。
+这组用例还必须关掉压缩——否则线路上的长度由 zstd 决定，精心挑出来的边界值一个都落不到。
+
+**property 测试自己要证明走到了有意思的分支。** `TestPropertySenderRoundTripPreservesMessages`
+在断言 round-trip 之外还统计线路上到底出现了多少压缩帧、合并帧、加密帧、4 字节头帧，
+任何一类为 0 就直接失败。少了这一段，一个"所有分支都退化成明文独立帧"的回归会让
+round-trip 断言全部通过。
+
+**编码侧也有 fuzz。** `FuzzCodec` 覆盖解码；`FuzzSenderRoundTrip` 用 fuzz 输入同时派生
+sender 配置和消息序列，以 client codec 作为独立 oracle 验证 sender 编出来的东西能原样解回来。
+`FuzzWebSocketInboundFrames` 把任意字节当作握手后的帧流喂给状态机。
+
+```bash
+go test -run '^$' -fuzz FuzzSenderRoundTrip -fuzztime 60s
+go test -run '^$' -fuzz FuzzWebSocketInboundFrames -fuzztime 60s
+go test -run '^$' -fuzz FuzzCodec -fuzztime 60s
+```
 
 ## 验证
 
 ```bash
 go vet ./...
+go test ./...                      # 分配断言只在这一趟生效
 go test -race ./...
+go test -count=2 -shuffle=on ./...  # 用例之间不得有顺序依赖
 ```
+
+前两趟都要跑。`perf_test.go` 里那些"稳态零分配"的断言在 `-race` 下会自动跳过——竞态插桩会改变逃逸分析并自带簿记分配（实测同一条 Send+flush 路径不带 -race 是 0 次、带 -race 稳定多 1 次），那个数不代表被测代码。只跑 `-race` 的话，这类性能回退完全不会被检查到。
