@@ -11,8 +11,7 @@ import (
 )
 
 var (
-	ErrClientClosed   = errors.New("client closed")
-	ErrCipherRequired = errors.New("cipher required")
+	ErrClientClosed = errors.New("client closed")
 )
 
 // ClientConfig controls how a Client connects and processes messages.

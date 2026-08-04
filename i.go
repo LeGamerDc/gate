@@ -1,11 +1,5 @@
 package gate
 
-import "errors"
-
-var (
-	ErrMaxMessageSize = errors.New("message size > 32MB")
-)
-
 // SenderI is the per-connection outbound sender abstraction.
 type SenderI interface {
 	// Send copies data before enqueueing it. Callers may reuse data after
