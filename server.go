@@ -30,25 +30,52 @@ type Server struct {
 	err   error
 }
 
+// loggerOnce 保证包级 log 只被赋值一次。
+//
+// 原先每次 StartServer 都会覆盖 log，而事件循环 goroutine 正在读它——同进程
+// 起第二个 server 就是一个 data race，并且会把第一个 server 的 logger 换掉。
+// gnet 的 SetDefaultLoggerAndFlusher 本身也是进程级全局，所以这里的语义只能是
+// "全进程共用第一个 server 的 logger"，把它明确下来而不是留一个竞态。
+var loggerOnce sync.Once
+
 // StartServer starts a gate server in the background and returns once the
 // listener is ready to accept connections.
+//
+// 注意：gate 与 gnet 的日志是进程级全局的，同一进程内启动多个 server 时，
+// 只有第一个 server 的 Logger 生效。
 func StartServer(c *Config) (*Server, error) {
 	if err := c.purge(); err != nil {
 		return nil, err
 	}
-	logging.SetDefaultLoggerAndFlusher(c.Logger, nil)
-	log = c.Logger
+	loggerOnce.Do(func() {
+		logging.SetDefaultLoggerAndFlusher(c.Logger, nil)
+		log = c.Logger
+	})
 
 	e := &ev{
-		c:     c,
-		ready: make(chan serverReady, 1),
+		c:         c,
+		ready:     make(chan serverReady, 1),
+		trackIdle: c.IdleTimeout > 0,
 	}
 	s := &Server{
 		done: make(chan struct{}),
 	}
 
+	opts := []gnet.Option{
+		gnet.WithNumEventLoop(c.LoopCount),
+	}
+	if ka := c.keepAlive(); ka > 0 {
+		// 没有 SO_KEEPALIVE 时，被 NAT 静默丢弃的半开连接永远不会触发 OnClose，
+		// 会一直占着缓冲区和 handler。
+		opts = append(opts, gnet.WithTCPKeepAlive(ka))
+	}
+	if e.trackIdle {
+		// OnTick 是空闲连接扫描的驱动，不开 ticker 它根本不会被调用。
+		opts = append(opts, gnet.WithTicker(true))
+	}
+
 	go func() {
-		err := gnet.Run(e, c.protoAddr(), gnet.WithNumEventLoop(c.LoopCount))
+		err := gnet.Run(e, c.protoAddr(), opts...)
 		s.setErr(err)
 		close(s.done)
 	}()

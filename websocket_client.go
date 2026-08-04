@@ -15,15 +15,18 @@ import (
 // WebSocketClientConfig controls how a Client connects to a websocket gate
 // server.
 type WebSocketClientConfig struct {
-	URL            string
-	Handler        ClientHandler
-	Cipher         Cipher
-	MaxMessageSize int // default: 32MB
+	URL     string
+	Handler ClientHandler
+	Cipher  Cipher
+	// MaxMessageSize 同 ClientConfig.MaxMessageSize：<=0 时取默认值 32MB，
+	// 超过 32MB 会被拒绝（校验统一由 ClientConfig.purge 完成）。
+	MaxMessageSize int
 	SendQueueSize  int // default: 1024
 	Header         http.Header
 	Dialer         *websocket.Dialer
 }
 
+// purge 把校验完全委托给 ClientConfig.purge，这样两种传输不会出现两套上限。
 func (c *WebSocketClientConfig) purge() error {
 	if c.URL == "" {
 		return errors.New("websocket client url must set")

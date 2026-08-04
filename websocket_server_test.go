@@ -12,7 +12,6 @@ import (
 
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
-	"github.com/klauspost/compress/zstd"
 )
 
 func TestWebSocketServerAcceptsMultipleGateFramesInSingleBinaryMessage(t *testing.T) {
@@ -221,17 +220,12 @@ func TestWebSocketServerClosesOversizedHandshakeBuffer(t *testing.T) {
 	}
 }
 
-func TestReleaseIdleBuffersDropsOversizedCapacity(t *testing.T) {
-	state := &wsConnState{}
-	fillBuffer(&state.buf, maxReusableBufferCap+1024)
-	fillBuffer(&state.gateBuf, maxReusableBufferCap+1024)
-	fillBuffer(&state.fragmentBuf.payload, maxReusableBufferCap+1024)
-	state.fragmentBuf.active = false
+func TestReleaseIdleBuffersDropsOversizedCapacityOnceIdle(t *testing.T) {
+	state := newOversizedState()
 
-	state.buf.Reset()
-	state.gateBuf.Reset()
-	state.fragmentBuf.payload.Reset()
-	state.releaseIdleBuffers()
+	for i := 0; i < wsIdleReleasePasses; i++ {
+		state.releaseIdleBuffers()
+	}
 
 	if state.buf.Cap() > maxReusableBufferCap {
 		t.Fatalf("buf retained oversized capacity: %d", state.buf.Cap())
@@ -242,6 +236,48 @@ func TestReleaseIdleBuffersDropsOversizedCapacity(t *testing.T) {
 	if state.fragmentBuf.payload.Cap() > maxReusableBufferCap {
 		t.Fatalf("fragment payload retained oversized capacity: %d", state.fragmentBuf.payload.Cap())
 	}
+}
+
+// 反向用例：旧实现每个 traffic 事件都会把超大缓冲整块丢掉，一个稳定收发大
+// 消息的连接因此在每条消息上都要从零重新扩容。
+func TestReleaseIdleBuffersKeepsCapacityWhileBusy(t *testing.T) {
+	state := newOversizedState()
+
+	// 单次空闲不足以触发收缩。
+	state.releaseIdleBuffers()
+	if state.buf.Cap() <= maxReusableBufferCap {
+		t.Fatal("buf was dropped after a single idle pass")
+	}
+
+	// 每一轮都真的用到了大缓冲：无论跑多少轮都不应该收缩。
+	for i := 0; i < 4*wsIdleReleasePasses; i++ {
+		state.peakBuffered = maxReusableBufferCap + 1
+		state.releaseIdleBuffers()
+	}
+	if state.buf.Cap() <= maxReusableBufferCap {
+		t.Fatal("buf was dropped while the connection kept using it")
+	}
+	if state.gateBuf.Cap() <= maxReusableBufferCap {
+		t.Fatal("gateBuf was dropped while the connection kept using it")
+	}
+}
+
+func newOversizedState() *wsConnState {
+	// releaseIdleBuffers 会通过 conn 读取活跃时间来决定是否提前收缩，
+	// 所以这里必须挂一个真实的 Conn，而不是零值 wsConnState。
+	conn := &Conn{codec: serverCodec(maxMessageSize)}
+	conn.init()
+	conn.markOpen()
+	state := &wsConnState{conn: conn}
+	fillBuffer(&state.buf, maxReusableBufferCap+1024)
+	fillBuffer(&state.gateBuf, maxReusableBufferCap+1024)
+	fillBuffer(&state.fragmentBuf.payload, maxReusableBufferCap+1024)
+	state.fragmentBuf.active = false
+
+	state.buf.Reset()
+	state.gateBuf.Reset()
+	state.fragmentBuf.payload.Reset()
+	return state
 }
 
 func TestWebSocketHandleFrameRejectsBufferedOverflowOnFragmentCopy(t *testing.T) {
@@ -284,6 +320,89 @@ func TestWebSocketHandleFrameRejectsBufferedOverflowOnGateCopy(t *testing.T) {
 	if state.gateBuf.Len() != 30 {
 		t.Fatalf("gate buffer mutated after rejected frame: %d", state.gateBuf.Len())
 	}
+}
+
+// wsOutbound 自己编码帧头以便和 payload 一次写出，这里校验它和 gobwas 生成的
+// 头逐字节一致。
+func TestEncodeWSBinaryHeaderMatchesGobwas(t *testing.T) {
+	for _, size := range []int{0, 1, 125, 126, 127, 65535, 65536, 1 << 20} {
+		payload := make([]byte, size)
+		want := ws.MustCompileFrame(ws.NewBinaryFrame(payload))
+
+		var hdr [wsMaxServerHeaderSize]byte
+		n := encodeWSBinaryHeader(hdr[:], size)
+		if !bytes.Equal(hdr[:n], want[:len(want)-size]) {
+			t.Fatalf("size %d: header % x, want % x", size, hdr[:n], want[:len(want)-size])
+		}
+	}
+}
+
+// wsOutbound 必须把帧头和 payload 合成一次写：write 是 2 个 iovec，
+// writev 是 1+n 个，都不再额外拷贝 payload。
+func TestWSOutboundWritesHeaderAndPayloadInOneCall(t *testing.T) {
+	rec := &recordingWSWriter{}
+	out := &wsOutbound{conn: rec}
+
+	if err := out.write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if rec.writes != 0 {
+		t.Fatalf("write used %d plain Write call(s)", rec.writes)
+	}
+	if rec.writevs != 1 {
+		t.Fatalf("write used %d Writev call(s), want 1", rec.writevs)
+	}
+	if got := rec.lastIOV; got != 2 {
+		t.Fatalf("write produced %d iovecs, want 2", got)
+	}
+	if !bytes.Equal(rec.buf.Bytes(), ws.MustCompileFrame(ws.NewBinaryFrame([]byte("hello")))) {
+		t.Fatalf("unexpected framing: % x", rec.buf.Bytes())
+	}
+
+	rec.reset()
+	if err := out.writev([][]byte{[]byte("ab"), []byte("cd"), []byte("ef")}); err != nil {
+		t.Fatal(err)
+	}
+	if rec.writevs != 1 {
+		t.Fatalf("writev used %d Writev call(s), want 1", rec.writevs)
+	}
+	if got := rec.lastIOV; got != 4 {
+		t.Fatalf("writev produced %d iovecs, want 4 (header + 3 payload slices)", got)
+	}
+	if !bytes.Equal(rec.buf.Bytes(), ws.MustCompileFrame(ws.NewBinaryFrame([]byte("abcdef")))) {
+		t.Fatalf("unexpected framing: % x", rec.buf.Bytes())
+	}
+}
+
+type recordingWSWriter struct {
+	buf     bytes.Buffer
+	writes  int
+	writevs int
+	lastIOV int
+}
+
+func (r *recordingWSWriter) Write(p []byte) (int, error) {
+	r.writes++
+	return r.buf.Write(p)
+}
+
+func (r *recordingWSWriter) Writev(bs [][]byte) (int, error) {
+	r.writevs++
+	r.lastIOV = len(bs)
+	n := 0
+	for _, b := range bs {
+		m, err := r.buf.Write(b)
+		n += m
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+func (r *recordingWSWriter) reset() {
+	r.buf.Reset()
+	r.writes, r.writevs, r.lastIOV = 0, 0, 0
 }
 
 func startTestWebSocketServer(t *testing.T, cfg *Config) *Server {
@@ -362,57 +481,31 @@ func waitWebSocketMessages(t *testing.T, conn net.Conn, cipher Cipher, want int)
 	return msgs[:want]
 }
 
+// decodeWebSocketGatePayload 用 client 侧的 codec 策略解开一条 WS 二进制消息里
+// 携带的全部 gate 帧（服务端下行可能压缩、合包、加密）。
 func decodeWebSocketGatePayload(data []byte, cipher Cipher) ([][]byte, error) {
-	var msgs [][]byte
-	for len(data) > 0 {
-		frame, n, err := consumeFrame(data, maxMessageSize)
-		if err != nil {
-			return nil, err
-		}
-		decoded, err := decodeGateFrame(frame, cipher)
-		if err != nil {
-			return nil, err
-		}
-		msgs = append(msgs, decoded...)
-		data = data[n:]
+	c := clientCodec(maxMessageSize, maxMessageSize)
+	dec, err := newZstdDecoder(maxMessageSize)
+	if err != nil {
+		return nil, err
 	}
-	return msgs, nil
-}
-
-func decodeGateFrame(frame inboundFrame, cipher Cipher) ([][]byte, error) {
-	data := append([]byte(nil), frame.payload...)
-	if frame.e {
-		if cipher == nil {
-			return nil, errors.New("cipher required")
-		}
-		cipher.Decrypt(data)
-	}
-	if frame.z {
-		dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
-		if err != nil {
-			return nil, err
-		}
-		defer dec.Close()
-		data, err = dec.DecodeAll(data, nil)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if !frame.c {
-		return [][]byte{data}, nil
-	}
+	defer dec.Close()
 
 	var msgs [][]byte
 	for len(data) > 0 {
-		sub, n, err := consumeFrame(data, maxMessageSize)
+		f, n, ok, err := c.parse(data)
 		if err != nil {
 			return nil, err
 		}
-		subMsgs, err := decodeGateFrame(sub, cipher)
-		if err != nil {
+		if !ok {
+			return nil, io.ErrUnexpectedEOF
+		}
+		if err = c.deliver(f, cipher, dec, func(msg []byte, _ bool) error {
+			msgs = append(msgs, append([]byte(nil), msg...))
+			return nil
+		}); err != nil {
 			return nil, err
 		}
-		msgs = append(msgs, subMsgs...)
 		data = data[n:]
 	}
 	return msgs, nil

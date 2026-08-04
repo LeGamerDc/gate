@@ -5,12 +5,11 @@ import (
 	"testing"
 
 	"github.com/gobwas/ws"
-	"github.com/klauspost/compress/zstd"
 )
 
 var (
 	benchHeaderSink int
-	benchFrameSink  inboundFrame
+	benchFrameSink  frame
 	benchErrSink    error
 	benchByteSink   int
 )
@@ -42,137 +41,105 @@ func BenchmarkEncodeHeader(b *testing.B) {
 		b.Run(headerBenchmarkName(size), func(b *testing.B) {
 			var header [4]byte
 			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				benchHeaderSink = encodeHeader(header[:], size)
 			}
 		})
 	}
 }
 
-func BenchmarkConsumeFrame(b *testing.B) {
+// 协议解析现在只有 codec 一个入口，基准也跟着收敛到它身上。
+func BenchmarkCodecParse(b *testing.B) {
 	payload := bytes.Repeat([]byte("a"), 1024)
-	frame := buildFrame(payload, 0)
+	wire := mkFrame(payload, 0)
+	c := serverCodec(maxMessageSize)
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		benchFrameSink, benchHeaderSink, benchErrSink = consumeFrame(frame, maxMessageSize)
-		if benchErrSink != nil {
-			b.Fatal(benchErrSink)
+	for b.Loop() {
+		var ok bool
+		benchFrameSink, benchHeaderSink, ok, benchErrSink = c.parse(wire)
+		if benchErrSink != nil || !ok {
+			b.Fatalf("parse: ok=%v err=%v", ok, benchErrSink)
 		}
 	}
 }
 
-func BenchmarkReadFrame(b *testing.B) {
+func BenchmarkCodecReadFrame(b *testing.B) {
 	payload := bytes.Repeat([]byte("b"), 8*1024)
-	frame := buildFrame(payload, 0)
+	wire := mkFrame(payload, 0)
+	c := clientCodec(maxMessageSize, maxMessageSize)
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		r := bytes.NewReader(frame)
-		benchFrameSink, benchErrSink = readFrame(r, maxMessageSize)
+	for b.Loop() {
+		r := bytes.NewReader(wire)
+		benchFrameSink, benchErrSink = c.readFrame(r)
 		if benchErrSink != nil {
 			b.Fatal(benchErrSink)
 		}
 	}
 }
 
-func BenchmarkClientEncodeOutbound(b *testing.B) {
-	for _, tc := range []struct {
-		name    string
-		payload []byte
-		cipher  Cipher
-	}{
-		{name: "plain", payload: bytes.Repeat([]byte("x"), 256)},
-		{name: "encrypt", payload: bytes.Repeat([]byte("y"), 1024), cipher: xorCipher{key: 0x5a}},
-	} {
-		b.Run(tc.name, func(b *testing.B) {
-			client := &Client{
-				maxMessageSize: maxMessageSize,
-				cipher:         tc.cipher,
-			}
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				msg := outboundMsg{
-					data:    append([]byte(nil), tc.payload...),
-					encrypt: tc.cipher != nil,
-				}
-				frame, err := client.encodeOutbound(msg)
-				if err != nil {
-					b.Fatal(err)
-				}
-				benchByteSink += len(frame)
-			}
-		})
-	}
-}
-
-func BenchmarkClientHandleFrame(b *testing.B) {
+func BenchmarkCodecDeliver(b *testing.B) {
 	for _, tc := range []struct {
 		name   string
-		frame  inboundFrame
+		frame  frame
 		cipher Cipher
 	}{
 		{
 			name:  "plain",
-			frame: inboundFrame{payload: bytes.Repeat([]byte("p"), 256)},
+			frame: frame{payload: bytes.Repeat([]byte("p"), 256)},
 		},
 		{
 			name: "encrypt",
-			frame: func() inboundFrame {
+			frame: func() frame {
 				payload := bytes.Repeat([]byte("e"), 1024)
-				cipher := xorCipher{key: 0x33}
-				cipher.Encrypt(payload)
-				return inboundFrame{payload: payload, e: true}
+				xorCipher{key: 0x33}.Encrypt(payload)
+				return frame{payload: payload, e: true}
 			}(),
 			cipher: xorCipher{key: 0x33},
 		},
 		{
 			name: "compress",
-			frame: inboundFrame{
+			frame: frame{
 				payload: enc.EncodeAll(bytes.Repeat([]byte("z"), 8*1024), nil),
 				z:       true,
 			},
 		},
 		{
 			name: "compound_compress_encrypt",
-			frame: func() inboundFrame {
-				msg1 := bytes.Repeat([]byte("a"), 128)
-				msg2 := bytes.Repeat([]byte("b"), 256)
-				msg3 := bytes.Repeat([]byte("c"), 512)
-				payload := buildCompoundPayload(msg1, msg2, msg3)
+			frame: func() frame {
+				payload := buildCompoundPayload(
+					bytes.Repeat([]byte("a"), 128),
+					bytes.Repeat([]byte("b"), 256),
+					bytes.Repeat([]byte("c"), 512),
+				)
 				payload = enc.EncodeAll(payload, nil)
-				cipher := xorCipher{key: 0x66}
-				cipher.Encrypt(payload)
-				return inboundFrame{payload: payload, z: true, c: true, e: true}
+				xorCipher{key: 0x66}.Encrypt(payload)
+				return frame{payload: payload, z: true, c: true, e: true}
 			}(),
 			cipher: xorCipher{key: 0x66},
 		},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
-			dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+			c := clientCodec(maxMessageSize, maxMessageSize)
+			dec, err := newZstdDecoder(maxMessageSize)
 			if err != nil {
 				b.Fatal(err)
 			}
 			defer dec.Close()
 
 			handler := &benchClientHandler{}
-			client := &Client{
-				handler:        handler,
-				maxMessageSize: maxMessageSize,
-				dec:            dec,
-				cipher:         tc.cipher,
+			sink := func(msg []byte, _ bool) error {
+				handler.total += len(msg)
+				return nil
 			}
 
 			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				frame := tc.frame
-				frame.payload = append([]byte(nil), tc.frame.payload...)
-				if err := client.handleFrame(frame); err != nil {
+			for b.Loop() {
+				// deliver 会就地解密，所以每轮都要给一份新的 payload。
+				f := tc.frame
+				f.payload = append([]byte(nil), tc.frame.payload...)
+				if err := c.deliver(f, tc.cipher, dec, sink); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -189,25 +156,27 @@ func BenchmarkWebSocketDecodeMessages(b *testing.B) {
 		{
 			name: "binary",
 			frames: [][]byte{
-				buildFrame(bytes.Repeat([]byte("w"), 1024), 0),
+				mkFrame(bytes.Repeat([]byte("w"), 1024), 0),
 			},
 		},
 		{
 			name: "fragmented_binary",
 			frames: [][]byte{
-				buildFrame(bytes.Repeat([]byte("f"), 1024), 0)[:128],
-				buildFrame(bytes.Repeat([]byte("f"), 1024), 0)[128:],
+				mkFrame(bytes.Repeat([]byte("f"), 1024), 0)[:128],
+				mkFrame(bytes.Repeat([]byte("f"), 1024), 0)[128:],
 			},
 		},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			wire := buildWebSocketWireFrames(b, tc.frames...)
 			handler := &benchConnHandler{}
-			state := &wsConnState{conn: &Conn{handler: handler}}
+			conn := &Conn{handler: handler, codec: serverCodec(maxMessageSize)}
+			conn.init()
+			conn.markOpen()
+			state := &wsConnState{conn: conn}
 
 			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				handler.total = 0
 				state.buf.Reset()
 				state.gateBuf.Reset()

@@ -3,7 +3,6 @@ package gate
 import (
 	"bytes"
 	"context"
-	"io"
 	"net"
 	"sync"
 	"testing"
@@ -189,16 +188,19 @@ func buildFrame(payload []byte, flag byte) []byte {
 	return frame
 }
 
-func readTestFrame(t *testing.T, conn net.Conn) inboundFrame {
+// readTestFrame 只负责把线路上的一帧读出来给测试断言，两个方向都用得上
+// （client_test 读上行、e2e_test 读下行），所以用最宽松的 clientCodec 策略：
+// 标记合不合法由具体用例自己判断，读取本身不该先做策略过滤。
+func readTestFrame(t *testing.T, conn net.Conn) frame {
 	t.Helper()
 	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	frame, err := readFrame(conn, maxMessageSize)
+	f, err := clientCodec(maxMessageSize, maxMessageSize).readFrame(conn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return frame
+	return f
 }
 
 func waitMessage(t *testing.T, ch <-chan []byte) []byte {
@@ -212,13 +214,14 @@ func waitMessage(t *testing.T, ch <-chan []byte) []byte {
 	}
 }
 
-func TestConsumeFrameRejectsTruncatedPayload(t *testing.T) {
-	frame := buildFrame([]byte("abc"), 0)
-	_, _, err := consumeFrame(frame[:len(frame)-1], maxMessageSize)
-	if err == nil {
-		t.Fatal("expected truncated frame error")
-	}
-	if err != io.ErrUnexpectedEOF {
+// 截断的帧不是协议错误，只是"还没收齐"：codec 用 ok=false + err=nil 表达这一点。
+func TestClientCodecRejectsTruncatedPayload(t *testing.T) {
+	wire := buildFrame([]byte("abc"), 0)
+	_, n, ok, err := clientCodec(maxMessageSize, maxMessageSize).parse(wire[:len(wire)-1])
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok {
+		t.Fatalf("parsed a frame from a truncated buffer (n=%d)", n)
 	}
 }

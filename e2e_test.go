@@ -155,7 +155,7 @@ func TestE2ESendSharedSkipsEncryptAndLeavesSharedBufferUntouched(t *testing.T) {
 			return &testConnHandler{
 				conn: conn,
 				handle: func(conn *Conn, raw []byte) {
-					_ = conn.SendShared(shared, false)
+					_ = conn.SendStatic(shared, false)
 				},
 			}
 		}},
@@ -206,7 +206,7 @@ func TestE2ESendSharedCompressedSetsFlagWithoutMutatingPayload(t *testing.T) {
 			return &testConnHandler{
 				conn: conn,
 				handle: func(conn *Conn, raw []byte) {
-					_ = conn.SendShared(shared, true)
+					_ = conn.SendStatic(shared, true)
 				},
 			}
 		}},
