@@ -110,7 +110,11 @@ func (c codec) parse(src []byte) (f frame, n int, ok bool, err error) {
 	}
 
 	return frame{
-		payload: src[header : header+size],
+		// 三索引切片把 cap 封在 payload 末尾。少了这一层，compound 的子消息拿到的
+		// 切片 cap 会一直延伸到父 buffer 末尾，sink 里一次 append 就能悄悄覆盖掉
+		// 紧随其后的兄弟消息。它是免费的，而且让"子消息之间互不可见"成为结构性
+		// 事实，而不是依赖每个 sink 各自记得拷贝。
+		payload: src[header : header+size : header+size],
 		z:       z,
 		c:       cp,
 		e:       e,
@@ -119,8 +123,18 @@ func (c codec) parse(src []byte) (f frame, n int, ok bool, err error) {
 
 // readFrame 从流式数据源读取一个完整帧，payload 为新分配的独占内存。
 // 与 parse 共用同一套校验策略。
+//
+// 内部走 readFrameInto，自带一块局部暂存区。稳态读循环应当直接用 readFrameInto
+// 并复用暂存区：header 会被传进 io.Reader 这个接口调用，逃逸分析救不了它，
+// 于是每帧固定多一次 4 字节的堆分配。
 func (c codec) readFrame(r io.Reader) (frame, error) {
 	var header [4]byte
+	return c.readFrameInto(r, &header)
+}
+
+// readFrameInto 用调用方提供的暂存区读一个完整帧。
+// header 只在本次调用内使用，调用方可以在自己的读循环里长期复用同一块。
+func (c codec) readFrameInto(r io.Reader, header *[4]byte) (frame, error) {
 	if _, err := io.ReadFull(r, header[:2]); err != nil {
 		return frame{}, err
 	}

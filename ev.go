@@ -95,11 +95,20 @@ func (e *ev) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 		conn.markOpen()
 	}
 
+	// 两条构造失败的路径都要就地把状态落成 closed。
+	//
+	// 这里返回 gnet.Close 之后 gnet 会走 OnClose，但此刻还没 SetContext，
+	// connOf() 取不到这个 *Conn，于是 OnClose 会直接返回——markClosed 不会被执行。
+	// 而 Build 拿到过这个 *Conn，业务完全可能在 panic 之前就把它存到了别处；
+	// 一个永远停在 stateOpen 的陈旧 Conn，之后任何一次 Send/Close 都会去碰一个
+	// 已经被回收、并且可能已被新连接复用的 fd。
 	if !safeCall("SenderBuilder.Build", func() { conn.sender = e.c.SB.Build(conn) }) || conn.sender == nil {
+		conn.markClosed()
 		e.releaseSlot()
 		return nil, gnet.Close
 	}
 	if !safeCall("ConnHandlerBuilder.Build", func() { conn.handler = e.c.CHB.Build(conn) }) || conn.handler == nil {
+		conn.markClosed()
 		closeSender(conn)
 		e.releaseSlot()
 		return nil, gnet.Close
@@ -131,9 +140,16 @@ func (e *ev) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 }
 
 // reserveSlot 原子地占用一个连接名额，超过上限时返回 false。
+//
+// 没配上限时一次原子操作都不做：connCnt 是一条被所有 event loop 共享的 cache
+// line，每个 OnOpen 加一次、每个 OnClose 减一次，在连接 churn 高的场景下就是持续
+// 的跨核往返——而不限流时 gate 根本不读这个数。
 func (e *ev) reserveSlot() bool {
-	n := e.connCnt.Add(1)
-	if limit := e.c.MaxConnections; limit > 0 && n > int64(limit) {
+	limit := e.c.MaxConnections
+	if limit <= 0 {
+		return true
+	}
+	if n := e.connCnt.Add(1); n > int64(limit) {
 		e.connCnt.Add(-1)
 		return false
 	}
@@ -141,7 +157,9 @@ func (e *ev) reserveSlot() bool {
 }
 
 func (e *ev) releaseSlot() {
-	e.connCnt.Add(-1)
+	if e.c.MaxConnections > 0 {
+		e.connCnt.Add(-1)
+	}
 }
 
 // closeSender 调用业务可能自定义的 SenderI.Close，并隔离它的 panic。
@@ -167,7 +185,7 @@ func (e *ev) OnClose(c gnet.Conn, _ error) (action gnet.Action) {
 	if e.trackIdle {
 		e.conns.Delete(conn)
 	}
-	e.connCnt.Add(-1)
+	e.releaseSlot()
 
 	if conn.handler != nil {
 		safeCall("ConnHandler.Close", conn.handler.Close)
@@ -201,9 +219,11 @@ func (e *ev) OnTick() (delay time.Duration, action gnet.Action) {
 	}
 
 	var (
-		now     = time.Now()
-		timeout = e.c.IdleTimeout
-		closed  int
+		// 把截止时刻先算成一个 int64，扫描时每条连接只剩一次原子读加一次整数比较。
+		// 此前是 now.Sub(time.Unix(0, lastActive))：每条连接都要构造一个 time.Time
+		// 再做一次 Duration 减法，而这个循环在百万连接上是要走一遍的。
+		cutoff = time.Now().UnixNano() - int64(e.c.IdleTimeout)
+		closed int
 	)
 	e.conns.Range(func(k, _ any) bool {
 		conn, ok := k.(*Conn)
@@ -214,7 +234,7 @@ func (e *ev) OnTick() (delay time.Duration, action gnet.Action) {
 			e.conns.Delete(conn)
 			return true
 		}
-		if conn.idleFor(now) >= timeout {
+		if conn.idleSince(cutoff) {
 			conn.Close()
 			closed++
 		}
@@ -235,22 +255,18 @@ func (e *ev) OnTick() (delay time.Duration, action gnet.Action) {
 func (c *Conn) notifyReady() bool {
 	// 先把握手期间入队的消息放出去，再通知业务。
 	//
-	// sender 在连接尚不可写时会把消息留在队列里并复位 triggered，此时没有任何
-	// Wake 在路上；不主动 flush 的话，这批消息会一直滞留到业务下一次 Send。
+	// sender 在连接尚不可写时会把消息留在队列里且不 arm 唤醒，此时没有任何 Wake
+	// 在路上；不主动 flush 的话，这批消息会一直滞留到业务下一次 Send。
 	// 顺序也保证了 Build 阶段发的消息排在 OnReady 里发的消息前面。
-	if f, ok := c.sender.(flusher); ok {
-		f.flush()
+	//
+	// 走 flushHook 而不是对 c.sender 做类型断言，见 Conn.flushHook。
+	if c.flushHook != nil {
+		c.flushHook.flush()
 	}
 	if h, ok := c.handler.(ReadyHandler); ok {
 		return safeCall("ConnHandler.OnReady", h.OnReady)
 	}
 	return true
-}
-
-// flusher 是 SenderI 的可选扩展：实现了它的 sender 可以在连接变为可写时
-// 被要求立即排空队列。放成可选接口而不是加进 SenderI，是为了不破坏外部实现。
-type flusher interface {
-	flush()
 }
 
 // connOf 从 gnet 连接上下文取回 *Conn，两种传输都适用。

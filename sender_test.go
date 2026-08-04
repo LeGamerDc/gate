@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
@@ -434,7 +435,7 @@ func TestSenderSeparateChunkingKeepsHeadersIntact(t *testing.T) {
 		want = append(want, msg)
 		buf = append(buf, plainMsg(msg))
 	}
-	s.pushSeparate(buf...)
+	s.pushSeparate(buf)
 
 	frames := parseWire(t, w.wire())
 	if len(frames) != n {
@@ -712,7 +713,7 @@ func TestSenderBackpressureMidChunkClosesConnection(t *testing.T) {
 		plainMsg(bytes.Repeat([]byte("b"), 400)),
 		plainMsg(bytes.Repeat([]byte("c"), 400)),
 	}
-	s.pushSeparate(buf...)
+	s.pushSeparate(buf)
 
 	if g.closeCount() == 0 {
 		t.Fatal("running out of outbound budget mid-chunk must close the connection")
@@ -879,7 +880,7 @@ func TestSenderClusterSizeMatchesEncodedCompoundBody(t *testing.T) {
 		t.Fatalf("cluster size = %d, want %d", size, want)
 	}
 
-	s.pushCompound(buf, false)
+	s.pushCompound(buf, size, false)
 	frames := parseWire(t, w.wire())
 	if len(frames) != 1 || !frames[0].c {
 		t.Fatalf("got %d frame(s), want 1 compound frame", len(frames))
@@ -943,7 +944,7 @@ func TestSenderCompoundNeverExceedsProtocolLimit(t *testing.T) {
 
 	// 兜底路径：即使有人绕过 cluster 直接喂一组超限的消息，也必须退回独立帧
 	// 把它们发出去，而不是把一个对端必然拒收的帧丢上线路、也不是干脆丢掉。
-	s.pushCompound(buf, false)
+	s.pushCompound(buf, compoundBody(buf), false)
 	frames := parseWire(t, w.wire())
 	if len(frames) != len(buf) {
 		t.Fatalf("got %d frame(s), want %d standalone frames", len(frames), len(buf))
@@ -972,7 +973,7 @@ func TestSenderKeepsUncompressedPayloadWhenCompressionGrowsIt(t *testing.T) {
 		t.Skip("payload turned out to be compressible, nothing to assert")
 	}
 
-	s.pushSeparate(sendMsg{maskPermit: maskZ, data: payload})
+	s.pushSeparate([]sendMsg{{maskPermit: maskZ, data: payload}})
 	frames := parseWire(t, w.wire())
 	if len(frames) != 1 {
 		t.Fatalf("got %d frame(s), want 1", len(frames))
@@ -991,7 +992,7 @@ func TestSenderSeparateBudgetCoversTheLastMessage(t *testing.T) {
 	g.setBuffered(900) // 剩余额度 124
 
 	// 这条消息上线要占 200+2 = 202 字节，放不下。
-	s.pushSeparate(plainMsg(bytes.Repeat([]byte("a"), 200)))
+	s.pushSeparate([]sendMsg{plainMsg(bytes.Repeat([]byte("a"), 200))})
 
 	if n := len(w.wire()); n != 0 {
 		t.Fatalf("wrote %d byte(s) with only 124 byte(s) of budget left", n)
@@ -1155,14 +1156,22 @@ func BenchmarkSenderCompressParallel(b *testing.B) {
 		{"concurrency_numcpu", enc},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
+			var total atomic.Int64
 			b.ReportAllocs()
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
+				// 每个 worker 先本地累加，结束时才合并一次：直接写包级的
+				// benchByteSink 既是 data race，也会把所有 worker 拴在同一条
+				// cache line 上，量出来的争用有一半是基准自己制造的。
 				dst := make([]byte, 0, 8*1024)
+				local := 0
 				for pb.Next() {
-					benchByteSink += len(tc.e.EncodeAll(payload, dst[:0]))
+					local += len(tc.e.EncodeAll(payload, dst[:0]))
 				}
+				total.Add(int64(local))
 			})
+			b.StopTimer()
+			benchByteSink += int(total.Load())
 		})
 	}
 }
@@ -1200,4 +1209,14 @@ func BenchmarkSenderFlush(b *testing.B) {
 			}
 		})
 	}
+}
+
+// compoundBody 按 pushCompound 的口径算一组消息的 compound body 大小。
+// 绕过 cluster 直接构造分组的用例要用它，免得把一个和实际编码不符的长度喂进去。
+func compoundBody(buf []sendMsg) int {
+	n := 0
+	for _, m := range buf {
+		n += frameSize(len(m.data))
+	}
+	return n
 }

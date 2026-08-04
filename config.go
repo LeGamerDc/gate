@@ -52,13 +52,25 @@ type Config struct {
 	// 这个值决定了单个连接能让服务端缓冲多少数据。绝大多数业务的单条消息远小于
 	// 32MB，把它收紧到实际需要的量级（例如 64KB）可以显著降低被慢速大包打爆内存
 	// 的风险。
+	//
+	// 注意它还兼了第二个用途：AsyncDo 挂起期间，整条连接的入站积压上限是
+	// MaxMessageSize + 64KB，超过就关连接（见 Conn.onTraffic）。挂起时 gate 不
+	// 消费任何数据，而 gnet 会继续往连接缓冲里追加，没有上限的话就是一个可远程
+	// 触发的 OOM。所以如果业务的 AsyncDo 较慢、同时客户端还在持续发小包，
+	// 这个值要按"阻塞期间可能积压多少"来配，而不只是按单条消息的大小。
 	MaxMessageSize int
 	// MaxConnections 最大并发连接数，<=0 表示不限制。超过后新连接会被立即关闭。
 	MaxConnections int
 	// TCPKeepAlive 开启 SO_KEEPALIVE 并设置空闲探测时间，<=0 时使用默认值 60s；
 	// 传 DisableKeepAlive 关闭。
 	TCPKeepAlive time.Duration
-	// IdleTimeout 超过该时长没有收到任何数据的连接会被主动关闭，<=0 表示不启用。
+	// IdleTimeout 超过该时长没有**交付过完整消息**的连接会被主动关闭，
+	// <=0 表示不启用。
+	//
+	// 判据是"最后一次把一条完整消息交给 handler 的时刻"，不是"最后一次收到
+	// 字节"。两个直接后果：只发半个帧吊着连接的 slowloris 会被回收；反过来，
+	// 服务端单向下推不会让连接显得活跃。
+	//
 	// 与 TCPKeepAlive 互补：keep-alive 处理的是对端消失，IdleTimeout 处理的是
 	// 对端还在但已经不再是有效会话。
 	IdleTimeout time.Duration

@@ -44,7 +44,6 @@ type wsConnState struct {
 	conn *Conn
 
 	upgrader ws.Upgrader
-	upgraded bool
 
 	maxHandshakeBytes int
 	maxBufferedBytes  int
@@ -52,9 +51,12 @@ type wsConnState struct {
 
 	// 握手期间累积的请求信息。Upgrade 在数据不足时会整体重放，
 	// 所以每次尝试之前都要清空，见 resetHandshakeCapture。
-	hsURI      string
-	hsHeader   http.Header
-	hsCount    int
+	hsURI    string
+	hsHeader http.Header
+	hsCount  int
+
+	// 两个 bool 收拢在一起，免得各自撑出一段对齐 padding。
+	upgraded   bool
 	hsOverflow bool
 
 	buf         bytes.Buffer
@@ -209,11 +211,12 @@ func (w *wsConnState) rejection(err error) error {
 }
 
 func (w *wsConnState) onTraffic() gnet.Action {
-	// 活跃时间由 Conn.deliverOne 在真正交付一条完整消息时刷新，两种传输共用
-	// 同一个交付点。这里不能刷新：gnet 的 Wake 会先跑一遍 OnTraffic 再执行
-	// 发送回调，在入口 touch 会让"服务端定期下推、客户端一言不发"的连接
-	// 永远不被判定为空闲。
+	// 活跃时间由 Conn.deliverOne 在真正交付第一条完整消息时发布，两种传输共用
+	// 同一个交付点。这里不能无条件刷新：gnet 的 Wake 会先跑一遍 OnTraffic 再
+	// 执行发送回调，在入口 touch 会让"服务端定期下推、客户端一言不发"的连接
+	// 永远不被判定为空闲。endEvent 只是把本轮的标记复位。
 	defer w.releaseIdleBuffers()
+	defer w.conn.endEvent()
 
 	if err := w.readBufferBytes(); err != nil {
 		logErr(err)
@@ -288,10 +291,20 @@ func (w *wsConnState) upgrade() (bool, error) {
 	data := w.buf.Bytes()
 	idx := bytes.Index(data, wsEndOfHeaders)
 	if idx < 0 {
-		// 请求还没收全。缓冲区上限由 ensureBufferedLimit 把关。
+		// 请求还没收全。握手大小上限在这里把关而不是在 ensureBufferedLimit：
+		// 只有在这里才分得清"哪些字节属于握手请求"。不设这一条的话，一个永远
+		// 不发 \r\n\r\n 的连接可以一路把字节攒到总缓冲上限（默认 32MB+64KB）。
+		if w.maxHandshakeBytes > 0 && w.buf.Len() > w.maxHandshakeBytes {
+			return false, errWebSocketHandshakeTooLarge
+		}
 		return false, nil
 	}
 	end := idx + len(wsEndOfHeaders)
+	// 请求收全了，但请求本身超过了上限。此时后面可能还跟着流水线的数据帧，
+	// 那些不算在握手账上，所以比的是 end 而不是 w.buf.Len()。
+	if w.maxHandshakeBytes > 0 && end > w.maxHandshakeBytes {
+		return false, errWebSocketHandshakeTooLarge
+	}
 
 	w.resetHandshakeCapture()
 	_, err := w.upgrader.Upgrade(wsReadWrite{
@@ -311,6 +324,14 @@ func (w *wsConnState) upgrade() (bool, error) {
 	w.upgraded = true
 	// Handshake 已经转交给 Conn，这里只放掉自己这份引用。
 	w.hsHeader = nil
+	// 握手期的钩子到此为止，全部放掉。
+	//
+	// ws.Upgrader 里那五个回调都捕获了 w 和 path，onUpgrade 还捕获着业务的鉴权
+	// 闭包。它们只在升级过程中有用，但此前会跟着 wsConnState 活到连接关闭为止：
+	// 每条 WebSocket 连接都白白钉住一组闭包环境。upgraded 已经为 true，
+	// upgrade() 不会再走到这里，清空是安全的。
+	w.upgrader = ws.Upgrader{}
+	w.onUpgrade = nil
 
 	// 101 响应此刻已经写进 socket，连接从这一刻起才允许发送业务数据。
 	// 顺序很关键：先 markOpen 打开出站闸口，再 notifyReady 通知业务，
@@ -347,23 +368,32 @@ type wsFrame struct {
 
 func (w *wsConnState) nextFrame() (wsFrame, bool, error) {
 	data := w.buf.Bytes()
-	if len(data) < ws.MinHeaderSize {
+
+	header, headerLen, ok, err := parseWSHeader(data)
+	if err != nil {
+		return wsFrame{}, false, err
+	}
+	if !ok {
 		return wsFrame{}, false, nil
 	}
 
-	r := bytes.NewReader(data)
-	oldLen := r.Len()
-	header, err := ws.ReadHeader(r)
-	if err != nil {
-		if err == io.EOF || errors.Is(err, io.ErrUnexpectedEOF) {
-			return wsFrame{}, false, nil
-		}
-		return wsFrame{}, false, err
-	}
-
-	headerLen := oldLen - r.Len()
 	if header.Length > maxMessageSize {
 		return wsFrame{}, false, ErrMaxMessageSize
+	}
+	// RFC6455 §5.5：控制帧的 payload 不得超过 125 字节。
+	//
+	// 这一条必须判在"数据够不够一个完整帧"之前。放在后面的话，一个声称自己带
+	// 32MB payload 的 ping 会让我们先老老实实把字节攒进 w.buf，一直攒到撞上
+	// MaxWebSocketBufferedBytes 才失败——每条连接白白吃掉几十 MB，而按 RFC
+	// 判的话读到帧头第二个字节就能拒掉。
+	//
+	// 此前完全没有这个检查，三种控制帧各自烂在不同的地方：超长 ping 靠 gobwas
+	// 的 ControlWriter 溢出保护才报错，超长 close 会先把 close 响应写出去再报错，
+	// 而超长 pong 因为 HandlePong 只是丢弃 payload，干脆被静默接受了。
+	if header.OpCode.IsControl() && header.Length > ws.MaxControlFramePayloadSize {
+		return wsFrame{}, false, fmt.Errorf(
+			"websocket control frame payload %d exceeds the %d-byte limit",
+			header.Length, ws.MaxControlFramePayloadSize)
 	}
 	total := headerLen + int(header.Length)
 	if len(data) < total {
@@ -407,16 +437,31 @@ func (w *wsConnState) handleFrame(frame wsFrame) error {
 }
 
 func (w *wsConnState) handleControlFrame(frame wsFrame) error {
-	if err := wsutil.HandleClientControlMessage(w.conn.conn, wsutil.Message{
+	err := wsutil.HandleClientControlMessage(w.conn.conn, wsutil.Message{
 		OpCode:  frame.header.OpCode,
 		Payload: frame.payload,
-	}); err != nil {
+	})
+	if frame.header.OpCode != ws.OpClose {
 		return err
 	}
-	if frame.header.OpCode == ws.OpClose {
+
+	// close 帧要单独翻译一次。
+	//
+	// wsutil.ControlHandler.HandleClose 在写完 close 响应之后**总是**返回一个非 nil
+	// 的 ClosedError——正常关闭（1000）也不例外，那是它报告"对端关闭了"的方式，
+	// 不是错误。此前这里是先判 err != nil 就原样返回，于是：
+	//
+	//   - onTraffic 里那条 errors.Is(err, errWebSocketClosed) 的静默分支永远走不到，
+	//     每一次正常的客户端断开都会走 logInbound 打一条 warn。连接数一大就是纯刷屏。
+	//   - 下面那句 return errWebSocketClosed 成了不可达的死代码。
+	//
+	// 但真正的协议违规（非法的 close code、非 UTF-8 的 reason）不能一起吞掉，
+	// 那些必须留在错误路径上，所以只翻译 ClosedError 这一种。
+	var closed wsutil.ClosedError
+	if err == nil || errors.As(err, &closed) {
 		return errWebSocketClosed
 	}
-	return nil
+	return err
 }
 
 func (w *wsConnState) handleBinaryFrame(frame wsFrame) error {
@@ -475,7 +520,8 @@ func (w *wsConnState) shouldBufferGatePayload() bool {
 // 字节或未展开的 compound 直接塞给业务层。
 func (w *wsConnState) deliverGatePayload(data []byte) error {
 	c := w.conn.codec
-	for !w.conn.isBlocking() && len(data) > 0 {
+	// stopped()：handler 可能在上一条消息里就关掉了连接，见 Conn.stopped。
+	for !w.conn.isBlocking() && !w.conn.stopped() && len(data) > 0 {
 		f, n, ok, err := c.parse(data)
 		if err != nil {
 			return err
@@ -527,7 +573,7 @@ func (b *wsFragmentBuf) reset() {
 // drainGateMessages 消费 AsyncDo 挂起期间攒下来的 gate 帧。
 func (w *wsConnState) drainGateMessages() error {
 	c := w.conn.codec
-	for !w.conn.isBlocking() {
+	for !w.conn.isBlocking() && !w.conn.stopped() {
 		f, n, ok, err := c.parse(w.gateBuf.Bytes())
 		if err != nil {
 			return err
@@ -565,10 +611,16 @@ func (w *wsConnState) ensureBufferedLimit(extra int) error {
 		w.peakBuffered = used
 	}
 
+	// 握手期间这里用的也是总缓冲上限，而不是握手上限。
+	//
+	// 握手上限约束的是"握手请求本身能有多大"，可这个函数能看到的只是"这一轮读
+	// 事件带回来多少字节"，而握手和流水线紧跟其后的数据帧完全可能落在同一个读
+	// 事件里（gate 明确支持这种客户端，见 upgrade() 的注释）。拿总量去比握手
+	// 上限，等于把业务数据记在了握手的账上：一条合法连接只要第一个业务包大一
+	// 点，就会被判成"握手超限"断开，报的还是一个完全对不上的原因。
+	//
+	// 真正的握手大小限制改在 upgrade() 里按请求边界判——那里才知道请求到哪结束。
 	limit := w.maxBufferedBytes
-	if !w.upgraded {
-		limit = w.maxHandshakeBytes
-	}
 	if limit <= 0 || used <= limit {
 		return nil
 	}
@@ -606,13 +658,29 @@ func (w *wsConnState) releaseIdleBuffers() {
 	}
 	w.peakBuffered = 0
 
-	drop := w.idlePasses >= wsIdleReleasePasses ||
-		(w.bufferedBytes() == 0 && w.conn.idleFor(time.Now()) >= wsIdleReleaseAfter)
+	// 先看有没有东西值得回收，再决定要不要问时间。
+	//
+	// drop 的第二个条件里那次 time.Now() 要 31ns，而稳态下 idlePasses 每轮都被
+	// 重置成 0，短路根本救不了它——等于每个 traffic 事件白付一次时钟调用，
+	// 而绝大多数连接从头到尾都没有一块超过 maxReusableBufferCap 的缓冲可收。
+	drop := false
+	if w.hasOversizedBuffer() {
+		drop = w.idlePasses >= wsIdleReleasePasses ||
+			(w.bufferedBytes() == 0 && w.conn.idleFor(time.Now()) >= wsIdleReleaseAfter)
+	}
 	releaseIdleBuffer(&w.buf, drop)
 	releaseIdleBuffer(&w.gateBuf, drop)
 	if !w.fragmentBuf.active {
 		releaseIdleBuffer(&w.fragmentBuf.payload, drop)
 	}
+}
+
+// hasOversizedBuffer 报告三块缓冲里是否存在一块大到值得还给 GC 的。
+// 没有的话 releaseIdleBuffers 的整个收缩判断都可以跳过。
+func (w *wsConnState) hasOversizedBuffer() bool {
+	return w.buf.Cap() > maxReusableBufferCap ||
+		w.gateBuf.Cap() > maxReusableBufferCap ||
+		(!w.fragmentBuf.active && w.fragmentBuf.payload.Cap() > maxReusableBufferCap)
 }
 
 func releaseIdleBuffer(buf *bytes.Buffer, drop bool) {

@@ -1,10 +1,10 @@
 package gate
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 
@@ -71,10 +71,30 @@ type ClientHandler interface {
 	OnClose(*Client, error)
 }
 
+const (
+	// clientHeaderReserve 是 send 在 payload 前面预留出来的字节数，取 header 的
+	// 最大长度（4）。这样 writeLoop 可以就地把 header 写进这块空位，而不必再
+	// 分配一块新内存把 header 和 payload 拼起来。
+	clientHeaderReserve = 4
+	// clientReadBuffer 是 readLoop 的缓冲大小。
+	//
+	// codec.readFrame 会分别读 2 字节基础头、可能的 2 字节扩展头、以及 payload。
+	// 直接对着裸 net.Conn 读时，这就是每帧 2~3 次 read 系统调用；小包场景下几乎
+	// 全部时间都花在这上面。夹一层 bufio 之后一次 read 能覆盖多个帧。
+	//
+	// 取 4KB 而不是更大：客户端可能被拿去开几万条连接做压测，缓冲是按连接算的。
+	clientReadBuffer = 4096
+	// clientWriteBatch 是一次 writev 最多携带的帧数，与服务端的 separateChunk 同理。
+	clientWriteBatch = 32
+)
+
 type outboundMsg struct {
-	data    []byte
+	// buf 的前 clientHeaderReserve 字节是留给 header 的空位，payload 紧随其后。
+	buf     []byte
 	encrypt bool
 }
+
+func (m outboundMsg) payload() []byte { return m.buf[clientHeaderReserve:] }
 
 // Client is a simple reference gate client built on top of net.Conn.
 //
@@ -82,7 +102,10 @@ type outboundMsg struct {
 // no compound packing. Inbound messages fully support decrypt/decompress/
 // uncompound before being delivered to the handler.
 type Client struct {
-	conn           net.Conn
+	conn net.Conn
+	// br 是 conn 之上的读缓冲。readLoop 必须只经它读，不能再直接碰 conn：
+	// 缓冲里可能已经攒着后续帧的字节。
+	br             *bufio.Reader
 	handler        ClientHandler
 	maxMessageSize int
 	codec          codec
@@ -146,6 +169,7 @@ func newClientWithConn(conn net.Conn, cfg *ClientConfig) (*Client, error) {
 
 	c := &Client{
 		conn:           conn,
+		br:             bufio.NewReaderSize(conn, clientReadBuffer),
 		handler:        cfg.Handler,
 		maxMessageSize: maxMsg,
 		codec:          clientCodec(maxMsg, maxMsg),
@@ -209,8 +233,12 @@ func (c *Client) waitLoop() {
 func (c *Client) readLoop() {
 	defer c.wg.Done()
 
+	// header 暂存区在整个读循环里复用：交给 readFrame 的话它会被传进 io.Reader
+	// 接口调用而逃逸，等于每帧多一次 4 字节的堆分配。readLoop 是单 goroutine 的，
+	// 这块暂存区不会被别人看到。
+	var header [4]byte
 	for {
-		f, err := c.codec.readFrame(c.conn)
+		f, err := c.codec.readFrameInto(c.br, &header)
 		if err != nil {
 			if c.isClosed() {
 				return
@@ -229,15 +257,32 @@ func (c *Client) readLoop() {
 //
 // 所有权规则：只有在 msg 借用了别人的底层数组时才拷贝。
 //   - owned == true：codec 本次解码新分配的独占内存（解压输出），直接交出去。
-//   - !f.c：整帧就是一条消息，payload 来自 codec.readFrame，每帧新分配，
+//   - !f.c：整帧就是一条消息，payload 来自 codec.readFrameInto，每帧新分配，
 //     sink 只会被调用一次，之后 readLoop 不再引用它，同样是独占内存。
-//   - 其余情况（compound 的子消息）：msg 是父 payload 的一段切片，父 buffer 还要
-//     继续切出后面的子消息，handler 若留存就会读到别的消息，必须拷贝。
+//   - 其余情况（compound 的子消息）：msg 是父 payload 的一段切片，必须拷贝。
 //
-// 拿不准就拷贝——多一次分配远比 aliasing bug 便宜。
+// 最后这条为什么还留着：codec.parse 现在用三索引切片把子消息的 cap 封在自己的
+// payload 末尾，所以 handler 已经不可能通过 append 越界读写兄弟消息了。但
+// ClientHandler.OnMessage 没有"不得留存"的约定，而留住一条 20 字节的子消息就会
+// 把整个 compound 父 buffer（可能是几十 KB）一起钉在堆上。一条 compound 里有 N
+// 条子消息就是 N 次分配，这是明知的热路径成本，换的是"每条消息都能被独立留存"。
 func (c *Client) deliver(f frame) error {
+	// 解密在这里做完，codec 就不必再持有 Cipher。
+	//
+	// 此前每帧都要先 inboundCipher() 取一次 cipherMu 拿到包装器，加密帧随后在
+	// serialCipher.Decrypt 里再取一次；明文帧则白取一次锁。compound 的子帧按协议
+	// 不得携带 e 标记（subCodec 的 allow 是 0），所以整条入站路径上加密只可能
+	// 出现在这一个位置，提到这里来做不会漏掉任何东西。
+	if f.e {
+		if !c.decrypt(f.payload) {
+			// 保留原来的语义：收到加密帧但没有配置 Cipher 是协议错误。
+			return ErrCipherRequired
+		}
+		f.e = false
+	}
+
 	standalone := !f.c
-	return c.codec.deliver(f, c.inboundCipher(), c.dec, func(msg []byte, owned bool) error {
+	return c.codec.deliver(f, nil, c.dec, func(msg []byte, owned bool) error {
 		if !owned && !standalone {
 			msg = append([]byte(nil), msg...)
 		}
@@ -251,9 +296,25 @@ func (c *Client) deliver(f frame) error {
 	})
 }
 
+// writeLoop 把出站消息编码后写进连接。
+//
+// 每次醒来都会把此刻已经排在 sendCh 里的消息一并取走，攒成一次 writev
+// （TCP 下 net.Buffers.WriteTo 走 writev，其余传输退化成逐条 Write，与原先一致）。
+// 这里只 drain "已经在队列里"的消息，不会为了凑批而等待，所以不引入任何额外延迟。
+//
+// 此前是一条消息一次 Write：一个高频发小包的客户端几乎所有时间都耗在系统调用上，
+// 而服务端一侧早就在用同样的批量思路（见 sender.pushSeparate）。
 func (c *Client) writeLoop() {
 	defer c.wg.Done()
+	// 退出前把队列里剩下的消息丢掉。
+	//
+	// Send 会为每条消息分配并复制一份完整 payload，而 writeLoop 一旦退出就再也
+	// 没有人排空 sendCh。业务只要还留着这个已关闭的 Client（很常见：拿它读
+	// Wait() 的错误、做重连决策），整个队列的 payload 就一直可达——一个在拥塞
+	// 时被关掉的 client 可以就这样钉住上千条消息。
+	defer c.drainSendQueue()
 
+	frames := make([][]byte, 0, clientWriteBatch)
 	for {
 		select {
 		case <-c.closed:
@@ -262,18 +323,74 @@ func (c *Client) writeLoop() {
 			if c.isClosed() {
 				return
 			}
-			frame, err := c.encodeOutbound(msg)
-			if err != nil {
+			var err error
+			if frames, err = c.collectFrames(msg, frames[:0]); err != nil {
 				c.closeWithError(err)
 				return
 			}
-			if err := writeAll(c.conn, frame); err != nil {
+
+			// Buffers.WriteTo 会就地消费传进去的切片（推进头部、把发完的元素置 nil），
+			// 所以给它一个副本头，下一轮仍从 frames[:0] 重新填。
+			batch := net.Buffers(frames)
+			if _, err := batch.WriteTo(c.conn); err != nil {
 				if c.isClosed() {
 					return
 				}
 				c.closeWithError(err)
 				return
 			}
+		}
+	}
+}
+
+// collectFrames 编码 first，再把此刻已经排在 sendCh 里的消息一并编码进 dst，
+// 最多 clientWriteBatch 条。
+//
+// 关键是那个 default 分支：只取"已经到了"的消息，绝不等待。攒批因此完全由实际
+// 到达速率决定，不会给任何一条消息引入额外延迟——队列里只有一条时就发一条。
+func (c *Client) collectFrames(first outboundMsg, dst [][]byte) ([][]byte, error) {
+	frame, err := c.encodeOutbound(first)
+	if err != nil {
+		return dst, err
+	}
+	dst = append(dst, frame)
+
+	for len(dst) < clientWriteBatch {
+		// 每轮先看一眼是否已经关闭，再决定要不要继续攒。
+		//
+		// 关闭后队列里的消息本来就允许被丢弃，但继续 drain 意味着继续调用业务的
+		// Cipher.Encrypt：一个昂贵的 Cipher 会把 Close 拖长最多 31 次加密的时间，
+		// 而一个会阻塞的 Cipher 干脆能让 Wait() 永远不返回。
+		//
+		// 这个检查不能写成 select 的一个 case：closed 和 sendCh 同时就绪时 Go 会
+		// 在两者之间随机挑，停不干净。isClosed 是一次带 default 的非阻塞收，
+		// 约 2ns，而且是确定的。
+		if c.isClosed() {
+			return dst, nil
+		}
+		select {
+		case msg := <-c.sendCh:
+			if frame, err = c.encodeOutbound(msg); err != nil {
+				return dst, err
+			}
+			dst = append(dst, frame)
+		default:
+			return dst, nil
+		}
+	}
+	return dst, nil
+}
+
+// drainSendQueue 丢弃尚未发出的消息，释放它们持有的缓冲。
+//
+// 关闭之后队列里的消息本来就允许被丢弃（和服务端 sender.Close 的语义一致），
+// 这里只是把它们的内存也一并放掉，而不是留在 channel 里等业务扔掉整个 Client。
+func (c *Client) drainSendQueue() {
+	for {
+		select {
+		case <-c.sendCh:
+		default:
+			return
 		}
 	}
 }
@@ -297,15 +414,26 @@ func (c *Client) send(data []byte, encrypt bool) error {
 		return ErrClientClosed
 	}
 
-	msg := outboundMsg{
-		data:    append([]byte(nil), data...),
-		encrypt: encrypt,
-	}
+	// 一次分配就把整帧凑齐：前 clientHeaderReserve 字节留给 header，payload 紧随
+	// 其后。此前这里 append 拷一份，writeLoop 的 encodeOutbound 再 make 一块新的
+	// 把 header 和 payload 拼进去——一条消息两次分配、两次拷贝。
+	buf := make([]byte, clientHeaderReserve+len(data))
+	copy(buf[clientHeaderReserve:], data)
 
 	select {
 	case <-c.closed:
 		return ErrClientClosed
-	case c.sendCh <- msg:
+	case c.sendCh <- outboundMsg{buf: buf, encrypt: encrypt}:
+		// closed 和"队列还有空位"同时就绪时，Go 会在两个 case 之间随机挑，
+		// 所以这条消息完全可能是在 writeLoop 已经排空并退出**之后**才塞进去的。
+		// 那样它既不会被发出去，也再没有人排空——一直钉在 channel 里，
+		// 跟着这个已关闭的 Client 一起被业务持有（默认队列 1024 条）。
+		//
+		// 这里自己收一次尾：报出真实结果，并把内存放掉。
+		if c.isClosed() {
+			c.drainSendQueue()
+			return ErrClientClosed
+		}
 		return nil
 	}
 }
@@ -340,28 +468,30 @@ func (c *Client) Wait() error {
 	return c.err()
 }
 
+// encodeOutbound 就地把 header 写进 send 预留的空位里，返回完整的一帧。
+// 返回的切片是 msg.buf 的一段，不做任何新的分配。
 func (c *Client) encodeOutbound(msg outboundMsg) ([]byte, error) {
-	if len(msg.data) > c.maxMessageSize {
+	payload := msg.payload()
+	if len(payload) > c.maxMessageSize {
 		return nil, ErrMaxMessageSize
 	}
 
 	flag := byte(0)
-	if msg.encrypt && c.encrypt(msg.data) {
+	if msg.encrypt && c.encrypt(payload) {
 		flag |= maskE
 	}
 
-	var header [4]byte
-	n := encodeHeader(header[:], len(msg.data))
-	header[0] |= flag
-
-	frame := make([]byte, n+len(msg.data))
-	copy(frame, header[:n])
-	copy(frame[n:], msg.data)
-	return frame, nil
+	// header 贴着 payload 向前生长：短消息占 2 字节，长消息占 4 字节，
+	// 所以起点是 clientHeaderReserve - n。
+	n := frameOverhead(len(payload))
+	off := clientHeaderReserve - n
+	encodeHeader(msg.buf[off:], len(payload))
+	msg.buf[off] |= flag
+	return msg.buf[off:], nil
 }
 
 // encrypt/decrypt 是 client 侧唯一的 Cipher 调用入口，两个方向都在 cipherMu
-// 下串行执行。
+// 下串行执行。两者都返回"当时是否真的配置了 Cipher"。
 //
 // 为什么需要串行：readLoop 解密入站帧、writeLoop 加密出站帧，是两个不同的
 // goroutine。server 侧所有 Cipher 调用都被 gnet 事件循环串行化，因此 Cipher
@@ -387,31 +517,15 @@ func (c *Client) encrypt(data []byte) bool {
 	return true
 }
 
-func (c *Client) decrypt(data []byte) {
-	c.cipherMu.Lock()
-	defer c.cipherMu.Unlock()
-	if c.cipher != nil {
-		c.cipher.Decrypt(data)
-	}
-}
-
-// inboundCipher 返回交给 codec 的 Cipher。没配置 Cipher 时必须返回 nil 接口值，
-// 否则 codec 无法判断"收到加密帧但没有 cipher"（ErrCipherRequired）。
-func (c *Client) inboundCipher() Cipher {
+func (c *Client) decrypt(data []byte) bool {
 	c.cipherMu.Lock()
 	defer c.cipherMu.Unlock()
 	if c.cipher == nil {
-		return nil
+		return false
 	}
-	return serialCipher{c: c}
+	c.cipher.Decrypt(data)
+	return true
 }
-
-// serialCipher 把 client 的 Cipher 以"每次调用都持锁"的形式暴露给 codec：
-// codec 只认识 Cipher 接口，串行化必须发生在接口调用的内部。
-type serialCipher struct{ c *Client }
-
-func (s serialCipher) Encrypt(data []byte) { s.c.encrypt(data) }
-func (s serialCipher) Decrypt(data []byte) { s.c.decrypt(data) }
 
 func (c *Client) closeWithError(err error) {
 	c.closeOnce.Do(func() {
@@ -442,15 +556,4 @@ func (c *Client) isClosed() bool {
 	default:
 		return false
 	}
-}
-
-func writeAll(w io.Writer, data []byte) error {
-	for len(data) > 0 {
-		n, err := w.Write(data)
-		if err != nil {
-			return err
-		}
-		data = data[n:]
-	}
-	return nil
 }

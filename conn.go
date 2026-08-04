@@ -58,6 +58,35 @@ type Conn struct {
 	// 生成一次方法值闭包，这里改成每连接一次。
 	deliverFn func([]byte, bool) error
 
+	// flushHook 是内置 sender 在构造时自己登记的排空钩子，连接变为可写时调用。
+	//
+	// 它不能靠对 c.sender 做类型断言来拿：业务完全可以（也应该可以）用一个
+	// wrapper 包住内置 sender 做埋点、限流之类的事，
+	//
+	//	type metricsSender struct{ gate.SenderI }
+	//
+	// 而 flush() 是包私有方法——嵌入 SenderI 的 wrapper 永远不会满足那个接口，
+	// 断言必然失败。于是 WebSocket 握手期间入队的消息就再没有人负责排空，
+	// 如果业务此后不再 Send，它们会一直滞留到连接关闭。
+	// 让内层 sender 自己登记，包了几层都不影响。
+	flushHook interface{ flush() }
+
+	// sinceTouch 是自上次发布活跃时间以来又交付了多少条消息，见 markActive。
+	// 它只在连接所属的事件循环 goroutine 上读写（deliverOne 和两种传输的
+	// onTraffic 收尾处），所以不需要任何同步。
+	sinceTouch uint8
+
+	// closing 表示已经有人调用过 Conn.Close，但 gnet 的 OnClose 还没跑到。
+	//
+	// gnet 的 Close 是异步的（往事件循环排一个 task），所以在 OnClose 真正把
+	// state 落成 stateClosed 之前有一段窗口。入站投递必须在这段窗口里就停下来，
+	// 不能等到 state 变化，见 stopped。
+	//
+	// 位置紧挨着 sinceTouch 不是随手排的：它落在 sinceTouch 之后、指针字段之前
+	// 的那段对齐 padding 里，所以 Conn 的大小没有变。放到结构体末尾会让
+	// Conn 从 184 涨到 192 字节。
+	closing atomic.Bool
+
 	cipher    atomic.Pointer[Cipher]
 	handshake atomic.Pointer[Handshake]
 
@@ -75,8 +104,54 @@ func (c *Conn) touch() {
 	c.lastActive.Store(time.Now().UnixNano())
 }
 
+// activityRefreshMessages 是两次发布活跃时间之间最多能隔多少条消息。
+//
+// 它把"时间戳可以有多旧"这件事变成一个结构性上界：陈旧度不会超过连续
+// activityRefreshMessages 条消息的处理时长，与批次本身有多大无关。
+const activityRefreshMessages = 64
+
+// markActive 发布活跃时间，每 activityRefreshMessages 条消息一次。
+//
+// 活跃时间此前是在 deliverOne 里每条消息刷新一次的，语义没问题，代价却很高：
+// time.Now() 同时要取墙上时钟和单调时钟，实测 31ns，而整条 TCP 入站路径处理
+// 一条消息本来只要 31ns（parse 2.5ns + handler 1.7ns + 其余）——也就是说，
+// 一多半的入站 CPU 花在了给一个秒级精度的空闲判定打时间戳上。摊到 64 条上
+// 之后是约 0.5ns/条。
+//
+// 为什么必须在**进入 handler 之前**发布，而不是等整批处理完：OnTick 的空闲扫描
+// 跑在 gnet 自己的 ticker goroutine 上，和事件循环是并发的。批次结束才发布意味着
+// 整个批次期间 lastActive 都停在上一批的时刻，一条正在处理消息的连接会被判成空闲
+// 关掉。
+//
+// 为什么还需要 64 这个上界、"每批一次"不够：一次读事件能带回的消息数只受
+// 缓冲区大小约束（WebSocket 下 MaxWebSocketBufferedBytes 默认 32MB），所以
+// 一批里大量各自很短的 handler 累加起来照样可以超过 IdleTimeout——不需要谁
+// 真的阻塞。有了这个上界，误判要求"连续 64 条消息的处理时间超过 IdleTimeout"，
+// 那已经不是空闲判定该管的问题了。
+func (c *Conn) markActive() {
+	if c.sinceTouch == 0 {
+		c.touch()
+	}
+	if c.sinceTouch++; c.sinceTouch >= activityRefreshMessages {
+		c.sinceTouch = 0
+	}
+}
+
+// endEvent 结束本轮事件的活跃记账，由两种传输的 onTraffic 在收尾时各调用一次。
+// 复位之后，下一轮事件的第一条消息一定会重新发布时间戳。
+func (c *Conn) endEvent() {
+	c.sinceTouch = 0
+}
+
 func (c *Conn) idleFor(now time.Time) time.Duration {
 	return now.Sub(time.Unix(0, c.lastActive.Load()))
+}
+
+// idleSince 报告这条连接的最后活跃时刻是否早于 cutoff（UnixNano）。
+// 空闲扫描用它而不是 idleFor：调用方把截止时刻算一次，每条连接就只剩
+// 一次原子读加一次整数比较，不必逐条构造 time.Time。
+func (c *Conn) idleSince(cutoff int64) bool {
+	return c.lastActive.Load() <= cutoff
 }
 
 func (c *Conn) markOpen() {
@@ -84,6 +159,10 @@ func (c *Conn) markOpen() {
 }
 
 func (c *Conn) markClosed() {
+	// 顺带把 closing 也置上，这样 stopped() 只需要读一个字段就能同时覆盖
+	// "有人调用过 Close" 和 "OnClose 已经跑过" 两种情况。入站投递循环每条消息
+	// 都要问一次，省下来的那次原子读是实打实的（那条路径每条消息总共才 8ns）。
+	c.closing.Store(true)
 	c.state.Store(uint32(stateClosed))
 }
 
@@ -92,8 +171,29 @@ func (c *Conn) isClosed() bool {
 }
 
 // writable 报告现在是否允许向底层 socket 写。所有出站路径的唯一闸口。
+//
+// 刻意不看 closing：调用 Close 之后、gnet 的关闭 task 真正执行之前，fd 还是活的，
+// 此时把已经入队的消息刷出去是正确的（业务常见的用法就是"发一条拒绝消息然后关
+// 连接"）。closing 只用来停止**入站**投递，见 stopped。
 func (c *Conn) writable() bool {
 	return connState(c.state.Load()) == stateOpen
+}
+
+// stopped 报告这条连接是否已经不该再接收新的入站消息：业务调用过 Close，
+// 或者 OnClose 已经跑完。
+//
+// 两个条件都要看，因为 gnet 的 Close 是异步的：调用 Conn.Close() 只是往事件
+// 循环排了一个 task，state 要等 OnClose 才会变成 stateClosed。而入站投递的
+// 循环就跑在同一个事件循环上——不看 closing 的话，handler 在第一条消息上判定
+// "这条连接非法、关掉"之后，同一个读事件里剩下的消息照样会被投递进去。
+//
+// 这是有安全含义的：一个 TCP 读事件（或一个 WebSocket 二进制消息）里可以塞进
+// 多条 gate 消息，把 [伪造的登录包, 真正想执行的命令] 拼在一起发出来，命令就会
+// 在一条已经被判死的连接上执行。
+// 一次原子读就够：markClosed 会同时置上 closing，所以这一个字段已经覆盖了
+// "调用过 Close" 和 "OnClose 已经跑过" 两种情况。
+func (c *Conn) stopped() bool {
+	return c.closing.Load()
 }
 
 // onTraffic 消费当前连接缓冲区里所有已完整到达的消息。
@@ -109,7 +209,31 @@ func (c *Conn) writable() bool {
 // 依然凑不齐一个完整帧，consumed 为 0、不调 Discard，那块临时缓冲就不会归还池里
 // （由 GC 回收）。这是 gnet Peek/Discard 接口形状带来的固有取舍，但比原先"每条消息
 // 都丢两块"要好得多。
+// inboundBufferSlack 是入站缓冲在"一条最大消息"之外还允许富余多少。
+//
+// 取值和 WebSocket 侧的默认值一致（MaxWebSocketBufferedBytes 默认是
+// MaxMessageSize + 64KB），让两种传输在这件事上给出同一个数量级的保证。
+const inboundBufferSlack = 64 * 1024
+
 func (c *Conn) onTraffic() gnet.Action {
+	// 阻塞期间给入站缓冲封顶。
+	//
+	// AsyncDo 挂起时 gate 一个字节都不消费，而 gnet 会继续把新到的数据追加进
+	// 连接的弹性入站缓冲。此前这里没有任何上限：一个在慢速 AsyncDo 期间持续灌
+	// 数据的客户端，可以把单条连接的内存一路撑下去，而默认不开 IdleTimeout，
+	// 连接也不会被回收——一个可远程触发的内存 DoS。
+	//
+	// 只在阻塞时检查。没阻塞的时候 gate 每轮事件都会把所有完整帧消费掉，缓冲区
+	// 里剩下的只可能是半个帧，那本来就被 MaxMessageSize 封住了；把检查放到每轮
+	// 事件上只会误杀"一次读事件恰好带回很多数据"的正常连接。
+	if c.isBlocking() {
+		if limit := c.codec.maxMessage + inboundBufferSlack; c.conn.InboundBuffered() > limit {
+			log.Warnf("[gate] %s: inbound buffer exceeded %d bytes while blocked, closing connection",
+				c.Remote(), limit)
+			return gnet.Close
+		}
+	}
+
 	buf, err := c.conn.Peek(-1)
 	if err != nil || len(buf) == 0 {
 		return gnet.None
@@ -121,6 +245,10 @@ func (c *Conn) onTraffic() gnet.Action {
 	)
 	for consumed < len(buf) {
 		if c.isBlocking() {
+			break
+		}
+		// handler 在上一条消息里关掉了连接：这一批剩下的消息不能再投递。见 stopped。
+		if c.stopped() {
 			break
 		}
 		f, n, ok, perr := c.codec.parse(buf[consumed:])
@@ -151,6 +279,11 @@ func (c *Conn) onTraffic() gnet.Action {
 			logErr(e)
 		}
 	}
+	// 直接调用而不是 defer：这里只有一个出口，而 defer 在只带一条消息的批次上
+	// 就是纯开销（实测约 2ns，占这种批次总成本的 6%）。deliverOne 自己兜住了
+	// handler 的 panic，走不到"必须靠 defer 才能收尾"的路径；万一真有别的东西
+	// panic，下一轮事件的第一条消息会重新发布活跃时间，什么都不会丢。
+	c.endEvent()
 	return action
 }
 
@@ -159,13 +292,16 @@ func (c *Conn) onTraffic() gnet.Action {
 // gnet 核心没有任何 recover，在此之前一条能让业务解码 panic 的畸形消息会打死
 // 整个进程；现在爆炸半径收敛到单条连接。
 func (c *Conn) deliverOne(msg []byte, _ bool) (err error) {
-	// 活跃时间在这里刷新，而不是在 onTraffic 入口。
+	// 活跃标记打在这里，而不是打在 onTraffic 入口。
 	//
 	// 两个原因：gnet 的 Wake 会先跑一遍 OnTraffic 再执行发送回调，所以在入口
-	// touch 会让"服务端定期下推、客户端一言不发"的连接永远不被判定为空闲；
-	// 另外只在真正交付了一条完整消息时才算活跃，顺带让只发半个帧吊着连接的
+	// 标记会让"服务端定期下推、客户端一言不发"的连接永远不被判定为空闲；
+	// 另外只有真正交付了一条完整消息才算活跃，顺带让只发半个帧吊着连接的
 	// slowloris 也会被 IdleTimeout 收走。两种传输共用这一个交付点，语义一致。
-	c.touch()
+	//
+	// markActive 只在本轮事件的第一条消息上真的取一次时钟，后续消息就是一次
+	// 非原子的 bool 读（见 Conn.delivered）。
+	c.markActive()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -273,18 +409,40 @@ func (c *Conn) Remote() string {
 
 // wake 唤醒事件循环继续消费该连接的入站数据。
 // c.conn 为 nil 的情况只出现在 OnOpen 失败的清理路径和单元测试里。
+// wake 唤醒事件循环继续消费该连接的入站数据。
+//
+// 连接已经关闭时直接返回，不去碰底层 fd，理由见 Close。
 func (c *Conn) wake() {
-	if c.conn == nil {
+	if c.conn == nil || c.isClosed() {
 		return
 	}
 	logErr(c.conn.Wake(nil))
 }
 
+// Close 关闭连接。可以重复调用。
+//
+// 已经关掉之后就不再往下走。这一层是给业务持有陈旧 *Conn 这种用法兜底的：
+// 连接关掉之后业务手里往往还留着引用（清理逻辑、重连判断），再调一次 Close
+// 不该变成一次跨线程的 poller task。
+//
+// 需要说清楚的是，这**不是**在修一个 gnet 的缺陷：当前锁定的 gnet v2.9.7 在
+// Unix 上会先检查旧对象自己的 opened 标记（eventloop_unix.go 的 close/wake 两处），
+// Windows 的连接表干脆以 *conn 为 key，所以陈旧对象本来就碰不到被复用的 fd。
+// 这里只是把判断提前到 gate 自己这一侧，不依赖对方的实现细节。
+//
+// 它也不消除全部竞态：从别的 goroutine 调 Close 时，仍可能在 OnClose 把状态落成
+// closed 之前挤进来——那种情况下走的是正常关闭路径，本来就是对的。
 func (c *Conn) Close() {
 	if c.conn == nil {
 		c.markClosed()
 		return
 	}
+	if c.isClosed() {
+		return
+	}
+	// 先就地记下"要关了"，再排 gnet 的异步关闭 task：入站投递循环靠这个标记
+	// 立刻停手，不必等 OnClose，见 stopped。
+	c.closing.Store(true)
 	logErr(c.conn.Close())
 }
 
