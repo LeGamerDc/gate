@@ -324,11 +324,16 @@ for item := inbox.drain() { ... }    // 一次性摘走整条链
 push 进来的项目，其生产者会看到 `armed == true` 而跳过 `notify`，于是这一项要等到
 下一次有人 push 才被发现。
 
-### `Post` 在已关闭连接上静默丢弃
+### `Post` 的两条排队规则
 
-`Post` 的闭包在执行前要校验连接的 generation。连接已经关闭时闭包**不执行、不报错**
-——异步回来发现会话没了是常态，不该让每个调用点都写一遍判断。这条语义在
-[01](01-server-api.md#为什么必须用-post-回去) 里对业务承诺过。
+1. **连接已关闭 ⇒ 闭包不执行、不报错。** 执行前校验 generation 即可。异步回来发现
+   会话没了是常态，不该让每个调用点都写一遍判断。
+2. **连接处于暂停中 ⇒ 闭包排进该连接的待执行队列**，`resume` 之后按投递顺序执行。
+
+第 2 条是「暂停 = 整个串行域暂停」的一部分：不这样做的话，`Post` 的闭包会和
+`AsyncDo` 的函数体在业务状态上撞车——而后者已经被承诺是串行域的一员
+（见 [01](01-server-api.md#这个保证是怎么来的)）。排队的闭包有数量上限，
+超过即关闭连接（`ErrPendingOverflow`）。
 
 ---
 
@@ -390,18 +395,31 @@ O(1) 查表，没有哈希，没有 map。每次槽位被复用就 `gen++`，事
         c.reason = reason
         挂进 loop 的 reap 链
 
-阶段 4（回收）:
+阶段 4（回收）—— 分两步，可以隔开任意长的时间：
+
+  【A】拆 socket（一定发生，不等任何业务代码）
     1. 若是 WebSocket 且属于正常关闭 → 尝试写一个 close 帧（见 05）
     2. 出站队列非空且未超 CloseLinger → 再尝试写一次，写不完就下一轮再来
-    3. poller.del(fd)
-    4. close(fd)
-    5. OnClose(c, reason)          ← 恢复屏障包住
-    6. 归还内部资源；槽位 gen++；从 LRU 摘除
+    3. poller.del(fd) → close(fd)
+    4. 归还内部资源（读残片、出站 chunk、槽位 gen++）；从各条 LRU 摘除
+
+  【B】通知业务（可能被推迟）
+    5. 若该连接仍处于 AsyncDo 暂停中 → 挂进 loop 的 pendingClose 链，等 resume
+    6. OnClose(c, reason)          ← 恢复屏障包住
+    7. 放开对 Conn 对象的最后一个引用
 ```
 
 第 2 步是 `Outbound.CloseLinger` 的落点：连接会在 reap 链上多停留几轮，
 直到排空或超时。它保证了「回一条拒绝消息再关闭」这个模式**至少被尝试过**——
 但不保证送达，见 [01](01-server-api.md#尽力-flush到底承诺了什么)。
+
+**A 与 B 分开是 `AsyncDo` 串行域保证的实现基础**（[01 的 D18](01-server-api.md#d18-把-asyncdo-的函数体拉进串行域)）：
+`f` 正在另一个 goroutine 上跑时不能调 `OnClose`，否则两者会在业务状态上撞车。
+但也**不能因此推迟拆 socket**——fd 和缓冲必须立刻回收，10 万连接的规模下这些资源
+一刻都等不起。所以「拆资源」立刻做，「通知业务」排队等。
+
+代价是 `Conn` 对象（含 `State`）活得比 socket 长。fd 不泄漏；业务泄漏一个 goroutine
+才会跟着泄漏一个 `Conn`。`Shutdown` 不等待这些连接，见 [01](01-server-api.md#ctx-约束的是什么不约束什么)。
 
 ---
 
@@ -445,7 +463,7 @@ O(1) 查表，没有哈希，没有 map。每次槽位被复用就 `gen++`，事
 
 ```
 Pause():
-    depth++                              ← 可重入
+    depth++                              ← 可重入（AsyncDo 只允许一层，见下）
     if depth == 1:
         mod(fd, interest &^ Read)        ← 从这一刻起不再有读事件
         从空闲 LRU 摘除，挂进 pause LRU
@@ -453,9 +471,17 @@ Pause():
 
 resume():
     if --depth == 0:
+        从 pause LRU 摘除
+        执行暂停期间排队的 Post 闭包        ← 串行域按序恢复
+        若连接已被关闭（挂在 pendingClose 上）→ 走回收阶段 B，到此为止
         mod(fd, interest | Read)
-        从 pause LRU 摘除，touch 后挂回空闲 LRU
+        touch 后挂回空闲 LRU
 ```
+
+`AsyncDo` 在这之上多加两条：**同一连接同时只允许一个在途任务**（第二次调用返回
+`ErrAsyncBusy`），且 **goroutine 在当次回调返回之后才启动**。这两条加上「`resume`
+之前不执行 `OnClose` / `Post`」，构成了 `f` 属于串行域的完整论证，见
+[01](01-server-api.md#这个保证是怎么来的)。
 
 三条必须写进文档的性质：
 
@@ -538,6 +564,8 @@ resume():
 | R9 | 只有出站积压非空的连接在写兴趣集合里 |
 | R10 | 只有一个时间源：`wait` 的 timeout。不使用 `timerfd` / `EVFILT_TIMER` |
 | R11 | 每轮 accept 有上限；`EMFILE` 走预留 fd 路径并临时摘掉 listener 读兴趣 |
+| R12 | 回收分两步：拆 socket 立刻做，`OnClose` 可以等 `resume`。二者之间连接资源已全部归还 |
+| R13 | 暂停期间 `Post` 的闭包排队不执行；`resume` 时按投递顺序放出 |
 
 ---
 

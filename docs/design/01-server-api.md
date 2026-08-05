@@ -17,7 +17,7 @@
 - [Frame：预编码帧与广播](#frame预编码帧与广播)
 - [并发与关闭语义](#并发与关闭语义)
 - [背压](#背压)
-- [阻塞任务：Pause 与 AsyncDo](#阻塞任务pause-与-asyncdo)
+- [阻塞任务：AsyncDo 与 Pause](#阻塞任务asyncdo-与-pause)
 - [内存与 GC 预算](#内存与-gc-预算)
 - [配置](#配置)
 - [Server 生命周期](#server-生命周期)
@@ -136,9 +136,9 @@ func (c *Conn[S]) SendFunc(n int, fill func(b []byte) (int, error)) error // 直
 func (c *Conn[S]) Writable() bool            // 出站积压是否低于高水位
 
 // 调度
-func (c *Conn[S]) Post(f func(*Conn[S]))     // 把 f 排到该连接的事件循环上执行
-func (c *Conn[S]) Pause() (resume func())    // 暂停入站投递
-func (c *Conn[S]) AsyncDo(f func())          // Pause 的语法糖；f 内不得访问 State
+func (c *Conn[S]) Post(f func(*Conn[S]))     // 把 f 排进该连接的串行域执行
+func (c *Conn[S]) AsyncDo(f func()) error    // 在别的 goroutine 上跑 f，但仍属串行域
+func (c *Conn[S]) Pause() (resume func())    // 低级原语：只暂停，不提供独占保证
 
 // 其它
 func (c *Conn[S]) Close(reason error)        // reason 会原样传给 OnClose
@@ -250,11 +250,14 @@ type None = struct{}
 | `Writable` / `Remote` / `ID` / `Handshake` | 任意 goroutine | |
 | `Close` / `Post` | 任意 goroutine | |
 | `resume`（`Pause` 的返回值） | 任意 goroutine | 幂等 |
-| **`c.State`** | **只能在事件循环上**：`OnOpen` / `OnMessage` / `OnClose` / `Post` 的函数体内 | `AsyncDo` 的函数体**不算** |
-| **`SetCipher`** | **只能在事件循环上** | 理由见 [Cipher](#cipher) |
-| `AsyncDo` / `Pause` | 只应在 `OnMessage` 内 | |
+| **`c.State`** | **只能在串行域内**：`OnOpen` / `OnMessage` / `OnClose` / `Post` / **`AsyncDo`** 的函数体 | `Pause` 后自己起的 goroutine **不算** |
+| **`SetCipher`** | 同上（串行域内） | 理由见 [Cipher](#cipher) |
+| `AsyncDo` / `Pause` | 只能在串行域内调用 | |
 
-一句话记法：**要碰 `State`，就得在事件循环上；不在的话用 `Post` 回去。**
+一句话记法：**要碰 `State`，就得在串行域里；不在的话用 `Post` 排进去。**
+
+「串行域」= 这条连接上所有由 gate 排定顺序的执行体。`AsyncDo` 的函数体虽然跑在另一个
+goroutine 上，但 gate 保证它与其余成员不重叠，见[阻塞任务](#阻塞任务asyncdo-与-pause)。
 
 ---
 
@@ -336,12 +339,12 @@ type Conn[S any] struct {
 代价是 `Options` / `Server` / `Conn` / `Handler` 都带类型参数。这个传染是有边界的：
 `Frame`、`Outbound`、`Limits`、`Cipher`、`Logger`、`Stats`、所有 error 都不带。
 
-**线程约束**：`State` **只能在事件循环上访问**——`OnOpen` / `OnMessage` / `OnClose`
-和 `Post` 的函数体内。这四处对同一条连接是严格串行的。
+**线程约束**：`State` 只能在这条连接的**串行域**内访问——`OnOpen` / `OnMessage` /
+`OnClose` / `Post` / `AsyncDo` 的函数体。gate 保证这五者对同一条连接不重叠。
 
-**`AsyncDo` 的函数体不在此列**：它跑在另一个 goroutine 上，与 `OnMessage` 的剩余部分、
-与同一次回调里的另一个 `AsyncDo`、与 `OnClose` 都可能并发。要把异步结果写回状态，
-用 `Post`，见[阻塞任务](#阻塞任务pause-与-asyncdo)。
+唯一的例外是 `Pause` 之后业务自己起的 goroutine：那段代码 gate 排不了序，
+在其中访问 `State` 需要业务自己同步，或者用 `Post` 排回串行域。
+见[阻塞任务](#阻塞任务asyncdo-与-pause)。
 
 ### `ID` 与连接对象的生命周期
 
@@ -456,6 +459,7 @@ gate 全程持有所有权。
 | `ErrConnClosed` | 连接已关闭 | 停止推送，清理会话 |
 | `ErrSendQueueFull` | 积压达到 `Outbound.MaxBuffer` | 丢弃非关键推送，或提前用 `Writable()` 判断 |
 | `ErrMessageTooLarge` | 超过协议上限 32MB | 业务 bug |
+| `ErrAsyncBusy` | 该连接已有一次 `AsyncDo` 在途 | 见[阻塞任务](#这个保证是怎么来的) |
 | `ErrCipherConflict` | 对一条配了 `Cipher` 的连接调用 `SendFrame` | 见 [Frame](#frame预编码帧与广播) |
 
 ---
@@ -546,7 +550,9 @@ per-connection 独立密钥和「编码一次分发多次」在根本上不兼�
 
 - **返回 `nil` 的 `Send` 绝不泄漏内存。** 那块池化缓冲要么被写上线路，要么在拆连接时
   被回收，没有第三种结局。
-- **`OnClose` 恰好被调用一次。** `Close` 可以重复调用，第一次的 `reason` 生效。
+- **`OnClose` 至多被调用一次**，且在业务归还暂停令牌、进程仍存活时**恰好**一次。
+  `Close` 可以重复调用，第一次的 `reason` 生效。推迟的情形见
+  [阻塞任务的代价](#代价)。
 
 ### 关闭时已入队消息的处置
 
@@ -585,14 +591,12 @@ OnOpen → OnMessage* / Post* （交错，但串行）→ OnClose
 
 因此 `c.State` 在这四处不需要任何同步。
 
-**`AsyncDo` 的函数体不在这个串行域里。** 它跑在另一个 goroutine 上，会与三种东西并发：
+**`AsyncDo` 的函数体也在这个串行域里**，尽管它跑在另一个 goroutine 上。
+gate 用三个措施保证它不与其余成员重叠（拒绝重入、延迟启动、推迟 `OnClose`），
+见[阻塞任务](#这个保证是怎么来的)。
 
-- 调用它的那次 `OnMessage` 的**剩余部分**（`AsyncDo` 一返回，goroutine 就可能开始跑）；
-- 同一次回调里的**另一个** `AsyncDo`；
-- `OnClose`（连接可能在 RPC 期间被对端重置、被 `Shutdown`、或被写失败关掉）。
-
-所以它**不得访问 `State`**。这不是风格建议——违反它就是一个 `-race` 才抓得到的数据竞争。
-正确写法用 `Post` 回到事件循环，见[阻塞任务](#阻塞任务pause-与-asyncdo)。
+**`Pause` 之后业务自己起的 goroutine 不在串行域里**——那段代码由业务提供，
+gate 无从知道它何时开始。在其中访问 `State` 是一个 `-race` 才抓得到的数据竞争。
 
 对**不同连接**，回调可能在不同事件循环上并发。`Handler` 自身的字段必须是只读的
 或自带同步。
@@ -610,7 +614,7 @@ OnOpen → OnMessage* / Post* （交错，但串行）→ OnClose
 | `OnMessage` 返回 error | 是 | **是**，`reason` = 该 error | |
 | `OnMessage` panic | 是 | **是**，`reason` = `ErrHandlerPanic` | |
 | `Post` 的函数体 panic | 是 | **是**，`ErrHandlerPanic` | |
-| `AsyncDo` 的函数体 panic | 是 | **否**（连接不受影响） | 记日志，`resume` 照常执行 |
+| `AsyncDo` 的函数体 panic | 是 | 视连接状态而定 | 记日志，暂停照常归还；若连接已在等这次归还，则此时才触发 `OnClose` |
 | `OnClose` panic | 是 | 已在其中 | 记日志，清理继续 |
 
 一句话：**`OnClose` 只与成功返回的 `OnOpen` 配对。** 业务因此不必写「我到底初始化到
@@ -707,52 +711,94 @@ func (h *handler) pushWorldState(c *gate.Conn[*player], snap []byte) {
 
 ---
 
-## 阻塞任务：Pause 与 AsyncDo
+## 阻塞任务：AsyncDo 与 Pause
 
-`OnMessage` 跑在事件循环上，**不允许阻塞**。要做 RPC / DB 这类事情，
-必须先把这条连接的入站投递暂停掉，把阻塞逻辑挪到别的 goroutine，
-再用 `Post` 把结果**带回事件循环**：
+`OnMessage` 跑在事件循环上，**不允许阻塞**。要做 RPC / DB 这类事情，用 `AsyncDo`：
 
 ```go
 func (h *handler) OnMessage(c *gate.Conn[*player], msg []byte) error {
-	uid := c.State.id            // ← 在事件循环上读，安全
-	resume := c.Pause()          // 从这一刻起，这条连接不再投递新消息
-
-	go func() {                  // ← 这里**不能**碰 c.State
-		profile, err := rpc.Load(uid)
-		c.Post(func(c *gate.Conn[*player]) {   // ← 回到事件循环
-			defer resume()
-			if err != nil {
-				c.Close(err)
-				return
-			}
-			c.State.profile = profile          // 这里才能写 State
-			_ = c.Send(encode(profile))
-		})
-	}()
+	c.AsyncDo(func() {
+		profile, err := rpc.Load(c.State.id)   // ← 可以直接读写 State
+		if err != nil {
+			c.Close(err)
+			return
+		}
+		c.State.profile = profile
+		_ = c.Send(encode(profile))
+	})
 	return nil
 }
 ```
 
-`AsyncDo(f)` 是「暂停 + 起一个 goroutine 跑 f + 结束后恢复」的语法糖。
-两者的区别只在于**谁提供执行体**：业务通常有自己的 worker pool（限流、复用 goroutine），
-`Pause` 让它可以接管。
+**`f` 属于这条连接的串行域**：它不会与 `OnMessage`、`OnClose`、`Post` 的闭包或另一个
+`AsyncDo` 并发。因此在 `f` 里访问 `c.State` 是安全的，不需要任何同步，也不需要把结果
+`Post` 回去。
 
-### 为什么必须用 `Post` 回去
+### 这个保证是怎么来的
 
-**`f` 与三样东西并发**：调用它的那次 `OnMessage` 的剩余部分、同一次回调里的另一个
-`AsyncDo`、以及 `OnClose`（连接完全可能在 RPC 期间被对端重置或被 `Shutdown` 关掉）。
+`f` 跑在另一个 goroutine 上，天然有三个并发源。gate 逐个消掉：
 
-所以 `f` 里：
-
-| 可以 | 不可以 |
+| 并发源 | 消除方式 |
 | --- | --- |
-| `c.Send` / `c.SendFrame` / `c.SendFunc`（并发安全） | **`c.State`**（读写都不行） |
-| `c.Close` / `c.Post` / `resume` | `c.SetCipher` |
-| 只读的、进入 `f` 之前就复制好的快照 | |
+| ① 同一次回调里调用两次 `AsyncDo` | **拒绝重入**：已有一次在途时，再次调用返回 `ErrAsyncBusy` |
+| ② `f` 与**当次回调的剩余部分** | `AsyncDo` 只登记，**等回调返回之后**才启动 goroutine |
+| ③ `f` 与 `OnClose` | socket 立刻拆除，但 **`OnClose` 回调推迟到 `resume` 之后** |
 
-`Post(f)` 把 `f` 排进该连接所属事件循环的队列，在那里执行。连接已经关闭时 `f`
-**不会被执行**（也不会报错）——异步回来发现会话没了是常态，不该让每个调用点都写一遍判断。
+外加一条：暂停期间 `Post` 的闭包也**一起挂起**（见下）。
+
+①之所以够，是因为 `AsyncDo` 只能在事件循环上调用，而它一调用连接就暂停，
+**不会再有新的 `OnMessage` 被投递**——跨回调的并发本来就不可能，只剩同一次回调里
+调两次这一种，拒绝掉即可。
+
+②是把「什么时候 `go f()`」这个决定权收回 gate 自己手里。顺带的好处：`OnMessage`
+返回 error（连接要关）时干脆不启动 `f`，省掉一次注定没用的 RPC。
+
+③在语义上其实比不推迟更对——你不会想在一个正在回写玩家状态的 RPC 中途，
+就把这个玩家反注册掉。
+
+### 代价
+
+- **`Conn` 与 `State` 会活到 `f` 结束**，比 socket 长。fd、缓冲、poller 槽位在关闭时
+  立刻回收，但业务泄漏一个 goroutine 就会跟着泄漏一个 `Conn`。
+- **`Shutdown` 不等待在途的 `AsyncDo`**。那些连接的 `OnClose` 会在各自的 `f` 结束后
+  才触发；进程先退出的话就不触发了。所以准确表述是：**`OnClose` 至多调用一次；
+  业务归还了暂停令牌且进程仍存活时，恰好一次。**
+
+### `Pause`：不带保证的低级原语
+
+```go
+resume := c.Pause()   // 从这一刻起不再投递新消息，也不再执行 Post
+go myPool.Submit(func() {
+	defer resume()
+	// ⚠️ 这里**不能**碰 c.State：gate 不知道这段代码什么时候开始、是否独占
+})
+```
+
+`Pause` 只做一件事：暂停这条连接的串行域。它**不提供** `AsyncDo` 的独占保证——
+执行体由业务自己提供，gate 无从知道它何时开始、是否与别的东西重叠。
+
+用它的理由只有一个：**业务想用自己的 worker pool**（限流、复用 goroutine、带 tracing
+的执行器），而不是每次 `AsyncDo` 起一个新 goroutine。这种场景下 `State` 的串行性由
+业务自己负责，或者用 `Post` 回到事件循环再碰。
+
+### `Post`
+
+```go
+func (c *Conn[S]) Post(f func(*Conn[S]))
+```
+
+把 `f` 排进该连接所属事件循环的队列执行。`f` 在串行域内，可以安全访问 `State`。
+
+它是给**真正外部的触发源**用的：定时器、广播调度器、管理接口、以及上面那种
+自带 worker pool 的 `Pause` 用法。
+
+两条语义：
+
+- 连接已经关闭时 `f` **不会被执行**（也不会报错）。异步回来发现会话没了是常态，
+  不该让每个调用点都写一遍判断。
+- **连接处于暂停状态时 `f` 排队等待**，`resume` 之后按投递顺序执行。
+  这是「暂停 = 整个串行域暂停」的一部分——否则 `Post` 的闭包会和 `AsyncDo` 的 `f`
+  在 `State` 上撞车。排队的闭包数量有上限，超过即关闭连接（`ErrPendingOverflow`）。
 
 语义：
 
@@ -995,8 +1041,9 @@ err = srv.Shutdown(ctx)         // 优雅关闭
   `ctx` 到期也救不了。要在关闭时做落盘、结算这类耗时清理，**在 `OnClose` 里取一份
   `State` 的快照，把它交给业务自己的 worker，然后立刻返回。**
 - **在途的 `AsyncDo` 不会被等待。** `Shutdown` 不知道它们要跑多久，也不能保证它们
-  一定会结束。它们的 `Post` 回来时连接已经关闭，函数体不会被执行——这正是
-  `Post` 在已关闭连接上静默丢弃的用处。业务需要自己的 `context` 来收敛这些 goroutine。
+  一定会结束。这些连接的 socket 会被正常拆除（fd、缓冲、槽位都回收），
+  但它们的 `OnClose` 要等各自的 `f` 结束后才触发；进程先退出的话就不触发了。
+  业务需要自己的 `context` 来收敛这些 goroutine。
 
 这两条是 `Shutdown` 能给出确定时限的前提。
 
@@ -1501,7 +1548,7 @@ evio 更彻底：回调全是全局函数，连接状态由用户自己按 id �
 
 ### D8. `AsyncDo` → `Pause` 为原语
 
-见 [阻塞任务](#阻塞任务pause-与-asyncdo)。名字讲清楚它真正做的事，同时让业务能接管执行体。
+见 [阻塞任务](#阻塞任务asyncdo-与-pause)。名字讲清楚它真正做的事，同时让业务能接管执行体。
 
 ### D9. 拆开 `MaxMessageSize` 的两个职责
 
@@ -1591,19 +1638,39 @@ batch 样本上实测 Fastest 比 Better 快 24% 且压缩率相同，而常驻�
 但 `State` 是一个**字段**，字段访问没有地方插校验。要么放弃泛型内联状态，
 要么放弃池化。放弃池化便宜得多。
 
-### D18. `AsyncDo` 的函数体不在串行域内，用 `Post` 回到事件循环
+### D18. 把 `AsyncDo` 的函数体拉进串行域
 
-**问题。** 初稿写「`AsyncDo` 的函数体与回调互斥」。不成立：`AsyncDo` 一返回，
-goroutine 就可能开始跑，而 `OnMessage` 还没结束；同一次回调里两个 `AsyncDo` 之间
-也并发；`OnClose` 更是随时可能发生（对端 reset、`Shutdown`、写失败）。
-按初稿的说法去写业务，`c.State` 上就是一个数据竞争。
+**问题。** 初稿写「`AsyncDo` 的函数体与回调互斥」，但没有任何机制保证它。
+实际上有三个并发源：`AsyncDo` 一返回 goroutine 就可能开始跑而 `OnMessage` 还没结束；
+同一次回调里两个 `AsyncDo` 之间；以及 `OnClose`（对端 reset、`Shutdown`、写失败随时
+可能触发）。按初稿的说法去写业务，`c.State` 上就是一个数据竞争。
 
-**选择。** 承认它并发，明确**禁止在 `f` 里访问 `State`**，并提供 `Post` 作为回到
-事件循环的唯一通道。
+**第一版修法（已放弃）**：承认并发，禁止在 `f` 里访问 `State`，用 `Post` 回写。
+安全，但把每个异步逻辑都劈成两段，而且「不能碰 `State`」是一条**违反了只会静默出错**
+的软契约。
 
-**代价。** 异步逻辑要写成两段（干活 / 回写）。这是这类模型的固有形状，
-Netty（`ctx.executor().execute`）、Seastar（`submit_to`）都是同一个答案。
-写成一段的代价是把并发问题藏起来。
+**最终选择：把三个并发源逐个消掉**，让 `f` 真的进入串行域。
+
+| 并发源 | 消除方式 | 代价 |
+| --- | --- | --- |
+| 同一次回调里调两次 | 拒绝重入，返回 `ErrAsyncBusy` | 无 |
+| 与当次回调的剩余部分 | 只登记，回调返回后才 `go f()` | 无（还省掉一次注定没用的 RPC） |
+| 与 `OnClose` | socket 立刻拆，`OnClose` 推迟到 `resume` 之后 | `Conn` 活得比 socket 长 |
+
+**跨回调的并发本来就不可能**——`AsyncDo` 只能在串行域内调用，而它一调用连接就暂停，
+不会再有新的 `OnMessage` 被投递。所以只需要处理「同一次回调里调两次」。
+
+**代价。** `Conn` 与 `State` 活到 `f` 结束；`Shutdown` 不等待在途的 `AsyncDo`，
+那些连接的 `OnClose` 推迟触发甚至不触发（进程先退出时）。因此
+「`OnClose` 恰好一次」被精确成「至多一次；归还了暂停令牌且进程存活时恰好一次」。
+
+**`Pause` 保持为不带保证的低级原语**：执行体由业务提供，gate 排不了序。
+它存在的理由是让业务能用自己的 worker pool。
+
+**与 Netty / Seastar 的差别。** 它们的答案是「异步逻辑劈两段，结果 `submit_to` 回
+loop」，也就是被放弃的第一版。gate 能做得更进一步，是因为它对异步任务的形态做了更强的
+假设：**一条连接同时至多一个在途任务，且必须从串行域内发起**。这个假设对网关业务成立
+（一条连接的消息本来就要串行处理），对通用框架不成立，所以它们没法这么做。
 
 ### D19. `Reserve` / `Commit` → `SendFunc`（回调形态）
 
@@ -1722,7 +1789,7 @@ gate 的传输层只有 TCP 和 WS 两种、编解码只有一种，为这点灵
 | `Conn.SendNoEncrypt`（明文旁路） | `Conn.SendAlone`（**仍然加密**，见 D21） |
 | `Conn.SendStatic(data, compressed)` | `srv.NewFrame(data)` + `Conn.SendFrame`（GC 管理，无需释放） |
 | `Conn.UpdateCipher`（任意 goroutine） | `Conn.SetCipher`（**只能在事件循环上**，见 D-Cipher） |
-| `Conn.AsyncDo`（可访问业务状态） | 保留；原语改为 `Conn.Pause()`，**函数体内不得访问 `State`**，用 `Conn.Post` 回写 |
+| `Conn.AsyncDo`（重入、并发语义未定义） | 保留并收紧：**拒绝重入**、回调返回后才启动、`OnClose` 推迟到 `resume` 之后 ⇒ 函数体属于串行域，**可以直接访问 `State`**（D18）。裸暂停另开 `Conn.Pause()`，不带此保证 |
 | `Conn.Close()` | `Conn.Close(reason)` |
 | `Conn.RemoteIp/RemotePort/Remote` | `Conn.Remote() netip.AddrPort` |
 | `Config.Transport` + 4 个 WS 字段 | `Options.WebSocket *WebSocketOptions` |
