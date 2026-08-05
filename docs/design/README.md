@@ -78,7 +78,7 @@
 | 文档 | 内容 | 状态 |
 | --- | --- | --- |
 | [01-server-api.md](01-server-api.md) | 服务端接口：用户看到什么、怎么用、为什么这样设计 | ✅ |
-| 02-wire-protocol.md | 线路协议与 codec：消息头、标记位、compound、策略掩码 | 待写 |
+| [02-wire-protocol.md](02-wire-protocol.md) | 线路协议与 codec：帧头、标记位、compound、策略掩码、攻击面 | ✅ |
 | 03-outbound.md | 发送侧：队列、合批、拼包、压缩、加密、背压 | 待写 |
 | 04-reactor.md | 自建事件循环：epoll / kqueue、accept、缓冲、跨线程投递、生命周期 | 待写 |
 | 05-websocket.md | WebSocket 握手与帧层，以及与 TCP 的语义对齐 | 待写 |
