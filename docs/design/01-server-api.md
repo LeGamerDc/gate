@@ -15,8 +15,10 @@
 - [Conn：连接句柄](#conn连接句柄)
 - [发送](#发送)
 - [Frame：预编码帧与广播](#frame预编码帧与广播)
+- [并发与关闭语义](#并发与关闭语义)
 - [背压](#背压)
 - [阻塞任务：Pause 与 AsyncDo](#阻塞任务pause-与-asyncdo)
+- [内存与 GC 预算](#内存与-gc-预算)
 - [配置](#配置)
 - [Server 生命周期](#server-生命周期)
 - [错误与关闭原因](#错误与关闭原因)
@@ -38,8 +40,9 @@ package main
 
 import (
 	"context"
-	"log/slog"
 	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/LeGamerDc/gate"
 )
@@ -84,7 +87,7 @@ func main() {
 			MaxMessage: 64 << 10,
 			Idle:       5 * time.Minute,
 		},
-		Log: slog.Default(),
+		Log: zap.L(),
 	})
 }
 ```
@@ -128,6 +131,8 @@ type Conn[S any] struct {
 func (c *Conn[S]) Send(b []byte) error        // 复制入队，允许压缩 / 合包 / 加密
 func (c *Conn[S]) SendPlain(b []byte) error   // 复制入队，明文独立帧
 func (c *Conn[S]) SendFrame(f *Frame) error   // 零拷贝，引用计数；广播用
+func (c *Conn[S]) Reserve(n int) []byte       // 借一块出站缓冲，业务直接写进去
+func (c *Conn[S]) Commit(b []byte) error      // 提交 Reserve 的缓冲，所有权移交，零复制
 func (c *Conn[S]) Writable() bool             // 出站积压是否低于高水位
 func (c *Conn[S]) Pause() (resume func())     // 暂停入站投递
 func (c *Conn[S]) AsyncDo(f func())           // Pause 的语法糖
@@ -160,6 +165,7 @@ type Options[S any] struct {
 type Outbound struct {
 	CompressThreshold int
 	CompressLevel     CompressLevel
+	Dict              []byte // 可选：zstd 训练字典
 	MaxCluster        int
 	MaxBuffer         int
 	HighWater         int
@@ -203,17 +209,19 @@ type Cipher interface {
 	Open(dst, ciphertext []byte) ([]byte, error)
 }
 
-type Logger interface { // *slog.Logger 直接满足
-	Info(msg string, args ...any)
-	Warn(msg string, args ...any)
-	Error(msg string, args ...any)
+type Field = zap.Field                  // 类型别名，零成本
+type Logger interface {                 // *zap.Logger 直接满足
+	Info(msg string, fields ...Field)
+	Warn(msg string, fields ...Field)
+	Error(msg string, fields ...Field)
 }
+func SlogLogger(*slog.Logger) Logger    // slog 用户的适配器
 
 type CompressLevel uint8
 const (
-	CompressBetter CompressLevel = iota // 零值
-	CompressFastest
+	CompressFastest CompressLevel = iota // 零值，也是推荐值
 	CompressBalanced
+	CompressBetter
 	CompressBest
 )
 
@@ -324,7 +332,7 @@ c.SendPlain(b)  // 复制 b；明文独立帧，不压缩不合包不加密
 c.SendFrame(f)  // 不复制；发送一个预编码好的帧
 ```
 
-三个接口都是**入队**语义，立刻返回，真正的 `writev` 由事件循环合批执行。
+全部是**入队**语义，立刻返回，真正的 `writev` 由事件循环合批执行。
 返回 `nil` 只表示「已入队」，不表示「已上线路」。
 
 `Send` 和 `SendPlain` 返回之后调用方可以立即复用 `b`。
@@ -332,7 +340,50 @@ c.SendFrame(f)  // 不复制；发送一个预编码好的帧
 `SendPlain` 的用途是那些不该被 gate 二次加工的字节：已经在业务层加密过的、
 或者对端会用固定 offset 解析的。
 
-三个接口都可以从**任意 goroutine** 调用。
+所有发送接口都可以从**任意 goroutine** 调用。
+
+### 复制的成本，以及怎么绕开它
+
+`Send` / `SendPlain` 会复制 `b`，因为调用方在它返回之后就可以复用那块内存。
+这次复制走**分级 size-class 池**，因此：
+
+| | |
+| --- | --- |
+| 堆分配 | **0**（从池借，flush 完成后归还） |
+| GC 压力 | **0** |
+| 实际成本 | 一次 memcpy。256 字节量级约 10ns，与整条入站路径处理一条消息同量级 |
+
+真正昂贵的是「每次 `Send` 一次 `make([]byte, n)`」——那才是 GC 灾难，而复制正是为了避开它。
+
+**为什么不是每连接一个 ring buffer。** 10 万连接下任何「按连接预留」的方案都不成立：
+哪怕每连接 4KB 的环形缓冲也是 400MB，而且环的尺寸必须按最大消息来定，否则大消息进不去。
+分级池的常驻成本只与**在途字节数**成正比，稳态下队列几乎是空的，而 `Outbound.MaxBuffer`
+已经给在途量封了顶。这是「按连接数付费」和「按在途量付费」的区别，在这个量级上是决定性的。
+
+想彻底省掉这次 memcpy 有两条路：
+
+```go
+// 路径 A：业务直接序列化进 gate 的出站缓冲，所有权移交
+b := c.Reserve(n)                  // 借 n 字节，len(b) == n
+b = proto.MarshalAppend(b[:0], m)  // 直接写进去
+if err := c.Commit(b); err != nil { // gate 接管，不再复制
+	// Commit 失败时缓冲已被 gate 回收，不要再碰 b
+}
+
+// 路径 B：一份数据发给 N 条连接，编码一次
+f, _ := gate.NewFrame(payload)
+for _, c := range room { _ = c.SendFrame(f) }
+f.Release()
+```
+
+`Reserve` / `Commit` 的契约：
+
+- `Commit` 之后 `b` 不再属于调用方，无论成功还是失败都不能再碰。
+- `Reserve` 之后必须 `Commit`。要放弃就 `c.Commit(b[:0])`，不能直接丢掉——那会泄漏一块池内存。
+- `Commit(b)` 中的 `b` 必须是 `Reserve` 返回的那块（允许 reslice 缩短或 append 增长）。
+
+诚实的补充：如果这条消息最终被**合包**，它在 flush 时还会被拷进 compound body 一次。
+`Reserve` / `Commit` 在独立帧路径上省得干净，在合包路径上是把 2 次复制变成 1 次。
 
 ### 错误
 
@@ -384,6 +435,59 @@ per-connection 独立密钥和「编码一次分发多次」在根本上不兼�
 
 ---
 
+## 并发与关闭语义
+
+发送接口可以从任意 goroutine 调用，`Close` 也是。这一节把两者相遇时的行为定死。
+
+### `Send` 与 `Close` 的竞态
+
+`Close(reason)` **同步**落状态位（一次原子存储），异步的只是真正的拆连接。因此：
+
+| 时刻 | `Send` 返回 | 已入队的消息 |
+| --- | --- | --- |
+| `Close` 之前 | `nil` | 会被 flush |
+| 与 `Close` 并发（无 happens-before） | `nil` **或** `ErrConnClosed`，两者都正确 | 若返回 `nil`，尽力 flush |
+| `Close` **返回之后** | **一定**是 `ErrConnClosed` | — |
+| `OnClose` 期间及之后 | `ErrConnClosed` | — |
+
+第三行是硬保证，业务可以依赖它。
+
+中间那一行做不到确定，**也不打算做到**：要确定就得让 `Send` 阻塞等事件循环确认，
+而「不阻塞、只入队」正是这套设计的前提。需要确定性的业务应当用自己的锁把
+`Close` 和 `Send` 串起来——那本来就是业务的会话状态该管的事。
+
+两条附带保证：
+
+- **返回 `nil` 的 `Send` 绝不泄漏内存。** 那块池化缓冲要么被写上线路，要么在拆连接时
+  被回收，没有第三种结局。
+- **`OnClose` 恰好被调用一次。** `Close` 可以重复调用，第一次的 `reason` 生效。
+
+### 关闭时已入队消息的处置
+
+不同的关闭原因下处置**不一样**，这是刻意的：
+
+| 关闭原因 | 已入队消息 | 为什么 |
+| --- | --- | --- |
+| 业务 `Close(reason)`、`OnMessage` 返回 error | **尽力 flush** | 「回一条拒绝消息再断开」必须可靠 |
+| `ErrIdleTimeout`、`ErrServerClosed` | 尽力 flush | 正常关闭，出站方向没坏 |
+| `ErrProtocol`、`ErrHandlerPanic` | 尽力 flush | 坏的是入站方向 |
+| `ErrBackpressure`、底层写失败 | **丢弃** | 帧流已经有洞，继续写只会让对端在错位的流上解析 |
+
+「尽力 flush」的含义：在 `OnClose` 之前把队列写出去，写不完（对端已经不收了）就放弃。
+它不是一个可以等待的承诺——gate 没有、也不打算有 flush 完成回调。真需要确认送达，
+那是业务层 ack 该做的事。
+
+### 回调的串行性
+
+对**同一条连接**，`OnOpen` / `OnMessage` / `OnClose` 严格串行，且有全序：
+`OnOpen` → `OnMessage`\* → `OnClose`。`AsyncDo` 的函数体与它们互斥（这正是
+`Pause` 存在的意义）。因此 `c.State` 在这四处不需要任何同步。
+
+对**不同连接**，回调可能在不同事件循环上并发。`Handler` 自身的字段必须是只读的
+或自带同步。
+
+---
+
 ## 背压
 
 两条水位线，语义完全不同：
@@ -412,6 +516,41 @@ func (h *handler) pushWorldState(c *gate.Conn[*player], snap []byte) {
 **硬上限触发时关闭连接，而不是丢消息。** 从一条有状态的帧流中间抽掉几条，只会让
 对端状态机静默错乱，业务层什么都察觉不到；关闭连接则让对端立刻知道会话没了，
 重连即可恢复。这条规则在整个 gate 里没有例外。
+
+### 内核缓冲占满时会发生什么
+
+两个方向的正确行为**完全不同**，这是理解整套背压设计的关键。
+
+```
+对端读得慢 / 网络拥塞
+  └─ SO_SNDBUF 满 → writev 返回 EAGAIN 或部分写
+       └─ gate 保留未写完的部分，注册可写事件，等内核腾出空间续写   ← 从不阻塞
+            └─ 出站队列增长
+                 ├─ > HighWater  → Writable() = false        业务可主动降级
+                 └─ > MaxBuffer  → 关闭，OnClose(ErrBackpressure)
+
+对端发得快 / 我们 Pause 了
+  └─ 我们不读 → SO_RCVBUF 满 → TCP 通告零窗口
+       └─ 对端 TCP 停发，对端 send() 阻塞或 EAGAIN
+            └─ 服务端这边：什么都不发生
+```
+
+**收方向占满是正常状态，不是故障。** 用户态零内存增长，背压由 TCP 流控完成，
+不需要任何应用层机制。这正是 `Pause()` 定义成「一个字节都不从内核读」而不是
+「读进来先存着」的原因——后者等于在用户态重新实现内核已经做好的事，而且要为此
+再发明一个积压上限。
+
+**发方向占满才是需要处理的。** gate 从不阻塞在 `write` 上，也从不从队列中间丢消息，
+只有两条水位线：软的让业务降级，硬的关连接。
+
+两个实操要点：
+
+- **`Pause()` 期间不计入 `Limits.Idle` 的空闲时长。** 否则一个跑 6 分钟 RPC 的
+  `AsyncDo` 会被 5 分钟的空闲判定干掉。恢复投递之后重新开始计时。
+- **Linux 上显式 `setsockopt(SO_RCVBUF)` 会关掉内核的接收缓冲自动调优**
+  （`tcp_moderate_rcvbuf`），而且内核会把设定值翻倍用于记账。小包网关设成几十 KB 是
+  对的；有大消息的业务要按带宽时延积算，往小了拍会直接损失吞吐。`Socket` 的两个字段
+  零值都是「不设置」，也就是保留系统默认与自动调优。
 
 > 参考 Netty 的 `WriteBufferWaterMark` + `isWritable()`。Netty 还有一个
 > `channelWritabilityChanged` 事件回调；gate 这一版只做轮询式的 `Writable()`，
@@ -449,13 +588,20 @@ c.AsyncDo(func() { ... })
 
 语义：
 
-- 暂停期间数据不会丢，只是留在缓冲里不投递。
+- 暂停期间数据不会丢，只是不投递。
 - 可重入：多次 `Pause` 需要同样多次 `resume` 才恢复。
 - `resume` 幂等，重复调用无害。
 - 只应在 `OnMessage` 内 `Pause`。从别的 goroutine 调用时「单连接内串行」的保证
   不成立——事件循环可能已经越过了暂停检查。
-- 暂停期间对端仍在发数据。它的上限由 `Limits.MaxPending` 约束，超过就关闭连接
-  （`ErrPendingOverflow`）。
+- **暂停期间不计入 `Limits.Idle` 的空闲时长**，`resume` 之后重新开始计时。
+  否则一个跑 6 分钟 RPC 的 `AsyncDo` 会被 5 分钟的空闲判定干掉。
+- 暂停期间对端**仍在发**的数据留在内核 socket 缓冲里（`Pause` 会摘掉读事件注册），
+  用户态零增长，对端被 TCP 流控拖住。
+
+`Limits.MaxPending` 约束的只是一小块东西：**暂停发生在一批数据中间时，已经从内核读出来、
+但还没投递的那部分**。它的上界是「一次读批次 + 一条最大消息」，默认
+`MaxMessage + 64KB` 正是按这个算的。它不是「暂停期间对端能发多少」的上限——
+那个由内核缓冲和 TCP 流控负责，不需要应用层封顶。
 
 > **为什么原语是 `Pause` 而不是 `AsyncDo`。** 上一版只有 `AsyncDo`，名字讲的是
 > 「异步执行一个函数」，而它真正做的事是「暂停读侧」。名实不符导致两个后果：
@@ -467,6 +613,81 @@ c.AsyncDo(func() { ... })
 > `EV_DISABLE` 掉 `EVFILT_READ`——之后数据留在**内核** socket 缓冲里，
 > 对端被 TCP 流控自动拖住，用户态一个字节都不占。见
 > [平台无关性](#平台无关性为什么-api-里没有-epoll-的影子)。
+
+---
+
+## 内存与 GC 预算
+
+10 万连接是这个库的存在理由，所以内存必须是**可以被算出来**的，而不是跑起来再看。
+这一节列出全部内存项以及它们随什么增长。
+
+### 稳态零堆分配的路径
+
+`go test -benchmem` 可验证，这几条路径稳态下是 0 allocs/op：
+
+- 入站：读 → 解析 → 投递 → handler
+- 出站入队：`Send` 只有一次从**分级池**的借用
+- 出站 flush：拼包、压缩、加密、`writev` 的 iovec 与 header 暂存
+- 加密：`Overhead() == 0` 时全程原地
+
+「零堆分配」不等于「零内存」，而是**不向堆里灌垃圾**：所有短生命周期缓冲都来自池，
+用完归还。这直接决定了 GC 的扫描量和 STW 频率——十万连接的网关最怕的不是分配本身，
+是分配出来的对象进入 GC 的活跃集。
+
+### 按连接增长的内存
+
+| 项 | 量级 | 备注 |
+| --- | --- | --- |
+| 连接对象 + `State S` | 与 `S` 有关 | 值类型 `S` 内联，不额外分配 |
+| 未投递完的入站残片 | 稳态 **0** | 只有半个帧时才占；上界 `Limits.MaxPending` |
+| 出站队列 | 稳态 **0** | 按在途量付费，上界 `Outbound.MaxBuffer` |
+| 内核 socket 缓冲 | **几十 KB ~ 几百 KB** | 由 `Socket.RecvBuffer` / `SendBuffer` 决定 |
+| `Cipher` 实现的状态 | 取决于实现 | 见下 |
+
+**内核 socket 缓冲是这张表里最大的一项。** Linux 默认 rmem/wmem 各百来 KB，
+10 万连接真吃满就是几十 GB。任何在应用层抠每连接几 KB 的优化，在这一项面前都是零头。
+把它按业务实际收紧，是 10 万连接场景下**收益最大的单个动作**。
+
+**per-connection AEAD 状态值得单独量一次。** `crypto/aes` 在有 AES-NI 的机器上 GCM
+状态不大，但走通用实现时预计算表能到几 KB——10 万条独立密钥就是几百 MB。
+用 per-conn 独立密钥之前先测这个数；房间级共享密钥 + `SendFrame` 是另一条路。
+
+### 按事件循环增长的内存（不随连接数增长）
+
+跨调用的暂存空间一律**按事件循环**池化，不挂成连接级字段：
+
+| 项 | 量级 |
+| --- | --- |
+| 读缓冲 | 每 loop 一块（64KB 量级） |
+| flush 暂存（iovec、header、拼包缓冲） | 每 loop 一套（KB 量级） |
+| zstd 编码器 | 见下表 |
+
+出站写全部发生在连接自己的事件循环上且中途不让出，所以池里同时在外的对象数
+**等于事件循环数**。挂成连接级字段的话，十万连接光暂存空间就要白占几百 MB。
+
+### 压缩的内存
+
+编码器是**每事件循环一个**（`concurrency = 1`），不是全局共享池。所有压缩都发生在
+连接所属的事件循环上，因此不需要任何交接或争用，常驻内存从 `GOMAXPROCS ×`
+变成 `Loops ×`——而 `Loops` 是你可配的，`GOMAXPROCS` 不是。
+
+实测每 encoder（首次压缩后的堆增量）：
+
+| `CompressLevel` | 每 encoder | `Loops = 8` |
+| --- | --- | --- |
+| `CompressFastest`（零值） | 约 0.27 MB | 约 2 MB |
+| `CompressBalanced` | 约 1.32 MB | 约 11 MB |
+| `CompressBetter` | 约 4.27 MB | 约 34 MB |
+| `CompressBest` | 更高 | 更高 |
+
+- **懒初始化**：`CompressThreshold <= 0` 的 gate 一分钱都不付。
+- **压缩输出走同一个分级池**，稳态零堆分配。
+- **压完反而更大就丢弃压缩结果**：既省对端一次无谓解压，也保证一个刚好贴着上限的
+  body 不会因 zstd 膨胀越过协议上限。
+- **服务端零解压内存、零解压攻击面**：线路协议不接受上行压缩帧，服务端连解码器都
+  不存在，也就不存在解压炸弹。
+- `Outbound.Dict` 可以挂一个用协议样本训出来的 zstd 字典。对「几百种消息、每种都
+  长得差不多」的游戏协议，它让**单条小消息**压缩也变得划算，而不必依赖合包攒够体积。
 
 ---
 
@@ -486,7 +707,24 @@ c.AsyncDo(func() { ... })
 | `Limits` | 见下 | |
 | `Socket` | 见下 | |
 | `WebSocket` | `nil` | nil ⇒ 裸 TCP；非 nil ⇒ WebSocket |
-| `Log` | 必填 | `slog.Default()` 即可 |
+| `Log` | 必填 | `zap.L()` 即可 |
+
+### `Outbound`
+
+| 字段 | 零值 | 说明 |
+| --- | --- | --- |
+| `CompressThreshold` | 不压缩 | 独立帧按 payload 判定，合并帧按整批字节数判定 |
+| `CompressLevel` | `CompressFastest` | 同时决定编码器常驻内存，量级差 16 倍。见[压缩的内存](#压缩的内存) |
+| `Dict` | 无 | 可选 zstd 训练字典，让单条小消息压缩也划算 |
+| `MaxCluster` | 不合包 | 单个合并帧上限（含子 header）。大于协议上限的取值会被夹住 |
+| `MaxBuffer` | 不限制 | 出站积压硬上限，越过即关闭连接 |
+| `HighWater` | 不启用 | 软上限，越过后 `Writable()` 返回 false |
+
+**合并与压缩是相互独立的开关。** 关掉压缩不会连带关掉合并——大量小消息正是
+「该合包但不值得压缩」的典型场景，合包本身就能省下系统调用和小 TCP 段。
+
+零值的 `Outbound{}` 是全关的。要推荐配置请显式写 `gate.DefaultOutbound`：
+这样「什么都没配」和「配成不压缩不合包」在代码上是可区分的。
 
 ### `Limits`
 
@@ -512,13 +750,18 @@ c.AsyncDo(func() { ... })
 
 | 字段 | 零值 | 说明 |
 | --- | --- | --- |
-| `RecvBuffer` | 系统默认 | `SO_RCVBUF` |
-| `SendBuffer` | 系统默认 | `SO_SNDBUF` |
+| `RecvBuffer` | **不设置**（系统默认 + 自动调优） | `SO_RCVBUF` |
+| `SendBuffer` | **不设置**（系统默认） | `SO_SNDBUF` |
 | `Nagle` | `false`（即 `TCP_NODELAY`） | 置 true 才打开 Nagle |
 
 **10 万连接下内核 socket 缓冲才是内存大头。** Linux 默认 rmem/wmem 各百来 KB，
 真吃满就是几十 GB。一个只跑小消息的网关应该显式把它压到几十 KB。上一版完全没有
 透出这两个旋钮，却在应用层花大力气把每连接几 KB 的暂存空间池化掉——数量级差了两个。
+
+但**不要拍脑袋往小了设**：Linux 上显式 `setsockopt(SO_RCVBUF)` 会关掉内核的接收
+缓冲自动调优（`tcp_moderate_rcvbuf`），而且内核把设定值翻倍用于记账。有大消息或
+高带宽时延积的业务要按 BDP 算，设小了直接损失吞吐。零值（不设置）保留自动调优，
+这是安全的默认。占满时的行为见[背压](#内核缓冲占满时会发生什么)。
 
 `Nagle` 用「零值即推荐值」的取反命名，避免 `NoDelay bool` 那种零值等于错误默认的形状。
 `KeepAlive` 用 `DisableKeepAlive` 哨兵值也是同一个原则。
@@ -580,7 +823,8 @@ func (h *handler) OnClose(c *gate.Conn[*player], reason error) {
 		metrics.SlowClient.Inc()   // 这个数一涨就该去看下行带宽了
 	case errors.Is(reason, gate.ErrProtocol):
 		metrics.BadClient.Inc()
-		log.Warn("protocol violation", "remote", c.Remote(), "err", reason)
+		log.Warn("protocol violation",
+			zap.Stringer("remote", c.Remote()), zap.Error(reason))
 	}
 	unregister(c.State.id)
 }
@@ -614,9 +858,22 @@ type Cipher interface {
 c.SetCipher(myCipher)  // 可从任意 goroutine 调用；nil 表示关闭加密
 ```
 
-`Overhead() == 0` 时（流式 / CTR 类密码），gate 会传 `dst = src[:0]` 走**原地**路径，
-不产生任何拷贝——和上一版的 `Encrypt([]byte)` 成本相同。
-`Overhead() > 0` 时（AEAD，如 AES-GCM / ChaCha20-Poly1305）gate 按需预留空间。
+### 分配与线程模型
+
+三条保证，实现可以依赖：
+
+1. **`Overhead() == 0`（流式 / CTR 类）走原地路径。** gate 传 `dst = src[:0]`，
+   全程零拷贝零分配——与上一版 `Encrypt([]byte)` 成本相同。
+2. **`Overhead() > 0`（AEAD）时 `dst` 由 gate 从分级池提供**，容量保证是
+   `len(src) + Overhead()`。实现只要 `append` 进去就不会分配——这正是
+   `crypto/cipher.AEAD.Seal` 的契约。
+3. **一个 `Cipher` 实例只被该连接所属的事件循环触碰**，收发都在同一个 loop 线程上，
+   且严格按帧顺序调用。因此实现内部**不需要任何同步**，可以放心持有 nonce 计数器
+   或帧序号，每帧的 nonce 也不需要分配。
+
+`SetCipher` 是唯一的例外：它可以从任意 goroutine 调用（最典型的用法就是异步握手完成后
+换密钥）。gate 保证切换在**帧边界**生效——同一批消息里换了密钥，后续帧立刻用新密钥解，
+不会出现「用旧密钥解新帧」。交出去的 `Cipher` 实例业务不应再改动。
 
 > **为什么要改掉 `Encrypt([]byte)` / `Decrypt([]byte)`。** 原地、不改长度、无返回值的
 > 形状排除了所有 AEAD——而游戏网关要做防篡改迟早会撞上。更重要的是 `Decrypt`
@@ -677,18 +934,35 @@ WebSocket 模式下业务代码**一行都不用改**。gate 承诺两种传输�
 ### `Logger`
 
 ```go
+type Field = zap.Field   // 类型别名，零成本、完全互换
+
 type Logger interface {
-	Info(msg string, args ...any)
-	Warn(msg string, args ...any)
-	Error(msg string, args ...any)
+	Info(msg string, fields ...Field)
+	Warn(msg string, fields ...Field)
+	Error(msg string, fields ...Field)
 }
 ```
 
-签名与 `*slog.Logger` 完全一致，所以 `Log: slog.Default()` 直接可用，
-也可以传任何自己包装的实现。
+`*zap.Logger` **直接满足**这个接口，`Log: zap.L()` 即可。用 slog 的项目传
+`gate.SlogLogger(slog.Default())`。
 
-只有三级、没有 `Debugf` / `Fatalf`、也没有 `printf` 风格：gate 自己的日志全部在
-错误路径上，结构化参数（`"remote", c.Remote()`）比格式化字符串更适合被采集。
+只有三级、没有 `Debug` / `Fatalf`、也没有 `printf` 风格：
+
+- 没有 `printf`：结构化字段才能被采集和聚合，`"[gate] %s: inbound protocol error: %v"`
+  这种日志在 10 万连接的量级上是不可查询的。
+- 没有 `Debug`：gate 的原则是**每一条日志都应该是可执行的信号**。需要连接级追踪时
+  用 `Stats()` 和 `OnClose(reason)`，它们是结构化的、可聚合的、且没有采样问题。
+- 没有 `Fatalf`：库不该决定进程的生死。
+
+> **为什么 `zap.Field` 出现在公共 API 里，而 D7 说底座类型不该出现。** 界线是
+> **谁选的**：`gnet/pkg/logging.Logger` 和 `ws.RejectConnectionError` 是 gate 的
+> **实现选型**，换底座它们就变，泄漏出去意味着换底座那天所有用户的编译都会挂；
+> `zap.Field` 是**调用方**的选型，gate 换 reactor 不会导致它变。
+>
+> gate 的日志全部在错误路径上，所以 zap 的零分配优势对 gate 本身不是决定性的——
+> 选它的真正理由是让 gate 的日志能直接进业务已有的 sink 和字段规范。
+> 类型别名（而不是直接写 `zap.Field`）是留的一道口子：真要迁移，gate 侧改一行别名
+> 加一个适配器就够了。
 
 ### `Stats`
 
@@ -855,10 +1129,12 @@ evio 更彻底：回调全是全局函数，连接状态由用户自己按 id �
 `OnWebSocketUpgrade` 自选状态码要返回 `gobwas/ws` 的类型。**这两处都意味着换底层
 库的那天，所有用户的编译都会挂。**
 
-**选择。** gate 自己定义 `Logger`（签名对齐 `*slog.Logger`，不发明新东西）和
-`RejectUpgrade`。
+**选择。** gate 自己定义 `Logger` 和 `RejectUpgrade`，底座类型只出现在内部适配层。
 
 **代价。** 多两个类型声明和一层内部适配。
+
+**界线在哪。** 这条原则针对的是**实现选型**的类型——换底座它们就变。调用方选型的
+类型（例如 `zap.Field`）不在此列，见 D16。
 
 ### D8. `AsyncDo` → `Pause` 为原语
 
@@ -881,6 +1157,57 @@ evio 更彻底：回调全是全局函数，连接状态由用户自己按 id �
 
 一个决策而不是两个，不存在互相矛盾的配置状态。零值（nil）落在更常见的裸 TCP 上。
 
+### D13. `Send` 保留复制语义，另开 `Reserve` / `Commit` 作为零拷贝路径
+
+**问题。** 复制看起来像是白付的开销，尤其在「业务刚序列化完一块内存，转手就交给
+`Send`」这个最常见的场景里——那是第二次复制。
+
+**选择。** 默认路径保留复制，但让它落在**分级 size-class 池**上（零堆分配、零 GC）；
+另开 `Reserve` / `Commit` 让业务直接序列化进出站缓冲，所有权移交。
+
+**为什么不换成默认所有权移交。** 那会让最常用的接口带上一条「调用后不能再碰这块内存」
+的隐性契约，而这类契约的违反是**静默的**：数据被改写、发出去的是半新半旧的字节，
+没有任何地方会报错。默认接口应该是**误用了也只是慢一点**的那个。
+
+**为什么不是每连接 ring buffer。** 10 万连接下按连接预留不成立，且环的尺寸必须
+按最大消息定。分级池按在途量付费，而在途量已经被 `MaxBuffer` 封顶。
+
+**代价。** 两个额外的方法，以及它们自己的所有权规则——但这条规则只在你主动选择
+这条路径时才需要遵守。
+
+### D14. zstd 编码器改为每事件循环一个，默认等级改为 `CompressFastest`
+
+**问题。** 上一版按压缩等级共享一个 `concurrency = GOMAXPROCS` 的编码器，
+`EncodeAll` 内部要从 channel 里抢一个 encoder。常驻内存由 `GOMAXPROCS` 决定，
+而它在容器里未必是你想要的数，也不可配。
+
+**选择。** 每事件循环一个 `concurrency = 1` 的编码器。所有压缩本来就发生在连接所属的
+事件循环上，所以不需要任何交接；常驻内存变成 `Loops ×`，而 `Loops` 是配置项。
+
+默认等级从 `CompressBetter` 改成 `CompressFastest`（并让它成为零值）：在游戏协议
+batch 样本上实测 Fastest 比 Better 快 24% 且压缩率相同，而常驻内存差 16 倍
+（0.27MB vs 4.27MB 每 encoder）。真实数据上 Better 通常确实更小，需要的人显式配。
+
+**代价。** 默认压缩率在某些负载上会略降。这是可配的，而 16 倍的内存差不是。
+
+### D15. `Close` 之后的 `Send` 行为写成三档，而不是承诺一个确定值
+
+见[并发与关闭语义](#并发与关闭语义)。**「`Close` 返回之后 `Send` 一定报错」是硬保证；
+与 `Close` 并发的 `Send` 返回什么则不保证。**
+
+后者做不到确定，也不打算做到：要确定就得让 `Send` 阻塞等事件循环确认，
+而「不阻塞、只入队」是这套设计的前提。把它写清楚，比假装它是确定的、
+或者用一把锁把所有 `Send` 串起来要诚实。
+
+同一条记录还定死了**已入队消息在不同关闭原因下的处置**：正常关闭尽力 flush，
+背压和写失败一律丢弃——因为那两种情况下帧流已经有洞了。
+
+### D16. `Logger` 采用 zap 形状
+
+见[日志与统计](#日志与统计)。这条与 D7 看似冲突，界线在于**类型是谁选的**：
+实现选型的类型不能泄漏，调用方选型的类型可以。用类型别名 `type Field = zap.Field`
+留一道迁移口子。
+
 ---
 
 ## 参考与借鉴对照
@@ -894,8 +1221,9 @@ evio 更彻底：回调全是全局函数，连接状态由用户自己按 id �
 | **Netty** | `inEventLoop()` 快路径 | 内部优化：已在事件循环上时直接入队并在事件末尾 flush，不做跨线程唤醒 |
 | **evio** | 回调返回 `action` | `OnMessage() error`（D2），并让 error 顺带携带原因 |
 | **evio** | 极小的 API 表面 | 全部公共 API 压到一屏 |
-| **Seastar** | shard-per-core、shared-nothing | 连接不跨事件循环迁移；`Stats` 每 loop 独立计数 |
-| **Go stdlib** | `*slog.Logger` 签名 | `Logger` 接口不发明新形状（D7） |
+| **Seastar** | shard-per-core、shared-nothing | 连接不跨事件循环迁移；`Stats` 与 zstd 编码器每 loop 独立（D14） |
+| **zap** | 结构化字段的日志签名 | `Logger` 接口不发明新形状（D16） |
+| **Go stdlib** | `cipher.AEAD.Seal(dst, ...)` 的 dst 容量契约 | `Cipher.Seal`，实现 append 进 gate 给的缓冲即零分配 |
 | **Go stdlib** | `net.Listen` 的命名与就绪语义 | `Listen` 返回即在监听 |
 
 **明确不借鉴的：** Netty 的 `ChannelPipeline`（运行时可插拔的 handler 链）。
@@ -931,7 +1259,8 @@ gate 的传输层只有 TCP 和 WS 两种、编解码只有一种，为这点灵
 | `ConnHandler.Close()` | `Handler.OnClose(c, reason)` |
 | `ReadyHandler.OnReady()` | `Handler.OnOpen(c) (S, error)` |
 | `Config.SB` / `SenderBuilder` / `SenderI` | `Options.Outbound`（纯数据，无接口） |
-| `SenderConfig` | `Outbound`（`MaxClusterSize`→`MaxCluster`，`MaxBufferSize`→`MaxBuffer`，新增 `HighWater`） |
+| `SenderConfig` | `Outbound`（`MaxClusterSize`→`MaxCluster`，`MaxBufferSize`→`MaxBuffer`，新增 `HighWater`、`Dict`） |
+| `CompressLevel` 零值 = `CompressBetter` | 零值 = `CompressFastest`（**行为变更**，见 D14） |
 | `DefaultSenderBuilder` | `DefaultOutbound` |
 | `Conn.SendNoEncrypt` | `Conn.SendPlain` |
 | `Conn.SendStatic(data, compressed)` | `NewFrame(data, Compressed())` + `Conn.SendFrame` |
@@ -942,9 +1271,9 @@ gate 的传输层只有 TCP 和 WS 两种、编解码只有一种，为这点灵
 | `Config.Transport` + 4 个 WS 字段 | `Options.WebSocket *WebSocketOptions` |
 | `Config.MaxMessageSize` | `Limits.MaxMessage` + `Limits.MaxPending`（拆分） |
 | `Config.MaxConnections/IdleTimeout/TCPKeepAlive` | `Limits.MaxConns/Idle/KeepAlive` |
-| `Config.Logger`（gnet 类型） | `Options.Log`（gate 自己的 `Logger`，`*slog.Logger` 直接可用） |
+| `Config.Logger`（gnet 类型，printf 风格，进程级全局） | `Options.Log`（zap 形状，`*zap.Logger` 直接可用，每 server 一份） |
 | `ws.RejectConnectionError(...)` | `gate.RejectUpgrade(status, reason)` |
 | `Cipher.Encrypt/Decrypt` | `Cipher.Seal/Open` + `Overhead()` |
 | `StartServer` / `StartEventLoop` / `StartWebSocketServer` | `Listen` / `Run` |
 | `Server.Stop(ctx)` | `Server.Shutdown(ctx)` |
-| —— | `Conn.Writable()`、`Conn.ID()`、`Server.Stats()`、`Socket`（新增） |
+| —— | 新增：`Conn.Writable()`、`Conn.ID()`、`Conn.Reserve()/Commit()`、`Server.Stats()`、`Socket`、`Outbound.Dict` |
