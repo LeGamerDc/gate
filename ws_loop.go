@@ -119,7 +119,12 @@ func (l *loop) wsGateFeed(c *connCore, seg []byte) error {
 		c.in.carry = nil
 		data = merged
 	}
-	l.parseAndDeliver(c, data) // 暂停/预算/大帧接管都在内部 stash
+	// 暂停 / 投递预算截断 / 大帧接管都在 parseAndDeliver 内部 stash 进 carry。
+	// 这三种情况下**仍然继续喂入后续原始字节**：feed 已经消费掉的部分不可能
+	// 回退，中途放手会让 maskOff 相位与 WS 帧边界一起错位。安全性由两侧封顶
+	// 保证——carry 受 MaxPending 约束（超限即 ErrPendingOverflow 关闭），
+	// 而 processCarry 直接在 carry 上解析，不再假设它装得进 rbuf。
+	l.parseAndDeliver(c, data)
 	if merged != nil {
 		poolPut(merged)
 	}

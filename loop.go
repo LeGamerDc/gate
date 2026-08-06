@@ -101,7 +101,8 @@ type loop struct {
 	idleLRU, hsLRU, pauseLRU, stallLRU, lingerLRU lruList
 
 	carryQ    []*connCore
-	truncated bool // 本轮有预算截断 ⇒ 下轮 timeout 0
+	tick      uint64 // 迭代序号：投递预算按「轮」计量
+	truncated bool   // 本轮有预算截断 ⇒ 下轮 timeout 0
 
 	backoffUntil int64 // EMFILE 退避（accept 层使用）
 
@@ -269,9 +270,21 @@ func (l *loop) step() {
 		return
 	}
 	l.truncated = false
+	l.tick++
 
-	// 阶段 0：上一轮被预算截断的收件箱余项。
+	// 阶段 0：上一轮被预算截断的收件箱余项，以及上一轮留下的 carry
+	// （投递预算截断 / resume 之后的续投）。**先于新事件**处理：
+	// 已经从内核读出来的字节比再读一批更该优先消化，也让「每轮每连接
+	// 1024 条」真正是每轮一次，而不是读一次、carry 再来一次。
 	l.processInbox()
+	if len(l.carryQ) > 0 {
+		q := l.carryQ
+		l.carryQ = l.carryQ[:0]
+		for _, c := range q {
+			c.carryQueued = false
+			l.processCarry(c)
+		}
+	}
 
 	// 阶段 1：分发事件。
 	for i := range n {
@@ -299,16 +312,6 @@ func (l *loop) step() {
 			if e.read && s.c == c && c.state < stateDraining {
 				l.connReadable(c)
 			}
-		}
-	}
-
-	// 阶段 1.5：处理排队的 carry（resume / 投递预算截断留下的完整帧）。
-	if len(l.carryQ) > 0 {
-		q := l.carryQ
-		l.carryQ = l.carryQ[:0]
-		for _, c := range q {
-			c.carryQueued = false
-			l.processCarry(c)
 		}
 	}
 
@@ -457,6 +460,7 @@ func (l *loop) connReadable(c *connCore) {
 	// in-loop 快路径：批内的回包不需要唤醒，批收尾必然 flush（O14 用 defer 兜住）。
 	c.out.beginInLoop()
 	defer l.flushBatchEnd(c)
+	c.startDeliverBudget(l)
 
 	if c.ws != nil {
 		l.wsReadable(c) // WS：原始字节先过帧层，再进同一份 gate 帧循环（W1）
@@ -525,9 +529,9 @@ func (l *loop) readOK(c *connCore, n int, err error) bool {
 // parseAndDeliver 在 data 上解析出一条条完整帧并投递。
 // 返回 false 表示本次读事件到此为止（关闭 / 暂停 / 大帧接管 / 预算截断）。
 func (l *loop) parseAndDeliver(c *connCore, data []byte) bool {
-	delivered := 0
+	before := c.delivered
 	defer func() {
-		if delivered > 0 && c.state == stateOpen && c.pauseDepth == 0 {
+		if c.delivered > before && c.state == stateOpen && c.pauseDepth == 0 {
 			l.idleLRU.touch(&c.tnode, l.now()) // 活跃判据：交付了完整消息
 		}
 	}()
@@ -540,8 +544,10 @@ func (l *loop) parseAndDeliver(c *connCore, data []byte) bool {
 			l.stashCarry(c, data, true)
 			return false
 		}
-		if delivered >= deliverBudget {
-			l.stashCarry(c, data, false)
+		// 预算是**每读事件**的连接级计数：WS 下一个读事件会被切成很多段
+		// emit，用局部计数会被每段重置，公平预算形同虚设。
+		if c.delivered >= deliverBudget {
+			l.stashCarry(c, data, true)
 			l.queueCarry(c)
 			l.truncated = true
 			return false
@@ -563,7 +569,7 @@ func (l *loop) parseAndDeliver(c *connCore, data []byte) bool {
 			return true
 		}
 		l.deliverFrame(c, f)
-		delivered++
+		c.delivered++
 		data = data[need:] // ok 时 need 即本帧消费的字节数
 	}
 	return true
@@ -603,13 +609,17 @@ func (l *loop) deliverFrameBuf(c *connCore, body []byte) {
 	}
 }
 
-func (l *loop) stashCarry(c *connCore, data []byte, pauseCheck bool) {
+// stashCarry 把「已从内核读出、尚未投递」的字节存进 carry。
+// bounded = true 时施加 MaxPending 封顶——暂停与投递预算截断都属于这一类
+// （两者都可能让 carry 无限增长，而 06 对 MaxPending 的定义正是这一块）。
+// 帧边界不足留下的尾巴（bounded = false）天然 ≤ 一次读的量，不需要封顶。
+func (l *loop) stashCarry(c *connCore, data []byte, bounded bool) {
 	if len(data) > 0 {
 		buf := poolGet(len(data))
 		copy(buf, data)
 		c.in.carry = buf
 	}
-	if pauseCheck && len(data)+c.in.got > l.cfg.maxPending {
+	if bounded && len(data)+c.in.got > l.cfg.maxPending {
 		l.closeLocal(c, ErrPendingOverflow)
 	}
 }
@@ -635,11 +645,14 @@ func (l *loop) processCarry(c *connCore) {
 	}()
 	c.out.beginInLoop()
 	defer l.flushBatchEnd(c)
-	carryLen := len(c.in.carry)
-	copy(l.rbuf, c.in.carry)
-	poolPut(c.in.carry)
+	// 直接在 carry 缓冲上解析，不借道 rbuf——WS 路径下一个 WS 帧可以装下
+	// 远超 rbuf 的 gate 字节，投递预算截断留下的 carry 因此可能大于 rbuf，
+	// 拷进 rbuf 会切片越界（把一个合法客户端打成 HandlerPanic）。
+	c.startDeliverBudget(l)
+	carry := c.in.carry
 	c.in.carry = nil
-	l.parseAndDeliver(c, l.rbuf[:carryLen])
+	l.parseAndDeliver(c, carry)
+	poolPut(carry)
 }
 
 // ─── 批边界 ───

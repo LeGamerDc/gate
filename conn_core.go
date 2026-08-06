@@ -78,6 +78,8 @@ type connCore struct {
 	asyncResume  func() // asyncFn 对应的 resume
 	pendingClose bool   // Detached 但串行域未空闲，等 resume 后 onClose
 
+	delivered    int      // 本轮迭代已投递的消息数（公平性预算）
+	deliverTick  uint64   // delivered 对应的迭代序号
 	curInterest  interest // 当前 poller 兴趣（边沿动作：只在变化时 mod）
 	carryQueued  bool     // 已在 loop 的 carryQ 里
 	pausedActive bool     // 读闸的链表归属与计数是否已生效（让 exitPaused 幂等）
@@ -234,6 +236,16 @@ func (l *loop) resumeOnLoop(c *connCore) {
 // enterPaused / exitPaused 把「读闸的链表归属 + 计数」收敛成一对，
 // 保证 tnode 在 idle 与 pause 两条链之间**互斥**（同一个侵入式节点被挂进
 // 两条链会直接覆盖指针，把链表结构毁掉）。
+// startDeliverBudget 在一轮迭代里第一次触碰这条连接时重置投递计数。
+// 按「轮」而不是按「读事件」计量：WS 下一个读事件会被切成很多段 emit，
+// 而 carry 续投又是同一轮里的另一个阶段——按事件重置等于没有预算。
+func (c *connCore) startDeliverBudget(l *loop) {
+	if c.deliverTick != l.tick {
+		c.deliverTick = l.tick
+		c.delivered = 0
+	}
+}
+
 func (c *connCore) enterPaused(l *loop) {
 	l.modInterest(c, c.currentInterest()&^interestRead)
 	l.idleLRU.remove(&c.tnode)

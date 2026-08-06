@@ -70,6 +70,7 @@ type loopEnv struct {
 	iov    [][]byte
 	slab   chunkSlab
 	stats  *loopStats          // 与 loop.stats 同一对象；outbound 经它计数
+	quota  *quotaLease         // 全局出站预算的本 loop 租约（06「全局预算是近似的」）
 	aadHdr [maxHeaderSize]byte // buildFrameAAD 的 scratch：AAD 头的长命暂存
 
 	enc     *zstd.Encoder
@@ -83,7 +84,12 @@ type encoderOptions struct {
 }
 
 func newLoopEnv(opts encoderOptions) *loopEnv {
-	return &loopEnv{iov: make([][]byte, 0, iovMax), encOpts: opts, stats: &loopStats{}}
+	return &loopEnv{
+		iov:     make([][]byte, 0, iovMax),
+		encOpts: opts,
+		stats:   &loopStats{},
+		quota:   newQuotaLease(newServerBudget(0)), // 默认不限；server 装配时替换
+	}
 }
 
 func zstdLevel(l CompressLevel) zstd.EncoderLevel {

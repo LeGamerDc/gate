@@ -48,6 +48,8 @@ type Server[S any] struct {
 	conns       atomic.Int64 // MaxConns 先原子占位再 accept
 	handshaking atomic.Int64 // MaxHandshaking 同理
 
+	budget *serverBudget // MaxOutboundBytes：各 loop 按租约分配（近似口径）
+
 	frameMu  sync.Mutex
 	frameEnc *zstd.Encoder // NewFrame 专用（冷路径，锁保护）
 
@@ -97,6 +99,15 @@ func Listen[S any](opts Options[S]) (*Server[S], error) {
 
 	cfg := normalizeLoopConfig(opts.Outbound, opts.Limits, opts.WebSocket != nil)
 	encOpts := encoderOptions{level: opts.Outbound.CompressLevel, dict: opts.Outbound.Dict}
+	// 全局出站预算：零值取默认 1GB，Unlimited 关闭（保护性选项零值=默认）。
+	maxOut := opts.Limits.MaxOutboundBytes
+	switch {
+	case maxOut == 0:
+		maxOut = 1 << 30
+	case maxOut < 0:
+		maxOut = 0 // Unlimited
+	}
+	s.budget = newServerBudget(maxOut)
 
 	// listener：Linux 每 loop 一个（SO_REUSEPORT）；macOS 单 listener 在 loop 0。
 	// ":0" 陷阱（04）：不能让每个 listener 各自 bind 0——第一个取回真实端口，
@@ -132,6 +143,7 @@ func Listen[S any](opts Options[S]) (*Server[S], error) {
 		}
 		l := newLoop(p, sysIO{}, monotonicNow(), cfg, encOpts)
 		l.loopID = i
+		l.env.quota = newQuotaLease(s.budget)
 		l.onConnClosed = func(c *connCore) {
 			s.conns.Add(-1)
 			if c.hsCtx != nil { // 死在握手期：Open 前的计数要退回

@@ -156,10 +156,33 @@ func (o *outbound) charge(payloadLen int, ci Cipher) int {
 	return frameSize(payloadLen+cipherOverhead(ci)) + o.cfg.wireSlack
 }
 
-// enqueueLocked 完成预算扣减、入队与 arm，返回是否需要锁外唤醒。
-// 调用方必须已持有 o.mu 并完成准入检查。
-func (o *outbound) enqueueLocked(it stage1Item, charge int) (wake bool) {
+// admitLocked 是入队前的两道准入：每连接的 MaxBuffer 与全局的
+// MaxOutboundBytes（loop 配额租约）。通过时已完成扣减，调用方负责入队。
+// 必须持有 o.mu。
+func (o *outbound) admitLocked(charge int) bool {
+	if o.cfg.maxBuffer >= 0 && o.reservedWire+charge > o.cfg.maxBuffer {
+		return false
+	}
+	if !o.env.quota.acquire(charge) {
+		return false // 全局预算耗尽：同样是准入拒绝，帧流没有洞
+	}
 	o.reservedWire += charge
+	return true
+}
+
+// refund 退还 n 字节（编码退还、写出退还、abort、discard 都走这里），
+// 保证 reservedWire 与配额租约永远同步。必须持有 o.mu。
+func (o *outbound) refundLocked(n int) {
+	if n == 0 {
+		return
+	}
+	o.reservedWire -= n
+	o.env.quota.release(n)
+}
+
+// enqueueLocked 完成入队与 arm，返回是否需要锁外唤醒。
+// 调用方必须已持有 o.mu 并通过 admitLocked（charge 已扣）。
+func (o *outbound) enqueueLocked(it stage1Item) (wake bool) {
 	o.q1 = append(o.q1, it)
 	if !o.armed && !o.inLoop && o.flushable {
 		o.armed = true
@@ -181,8 +204,7 @@ func (o *outbound) send(b []byte, permit byte) error {
 		o.mu.Unlock()
 		return ErrMessageTooLarge
 	}
-	charge := o.charge(len(b), o.tailCipher)
-	if o.cfg.maxBuffer >= 0 && o.reservedWire+charge > o.cfg.maxBuffer {
+	if !o.admitLocked(o.charge(len(b), o.tailCipher)) {
 		o.mu.Unlock()
 		o.env.stats.sendQueueFull.Add(1)
 		return ErrSendQueueFull // 消息从未入队，帧流没有洞（O1）
@@ -191,7 +213,7 @@ func (o *outbound) send(b []byte, permit byte) error {
 	// 的窗口；memcpy 的量已被 maxMessage 封顶，且分级池取放无锁。
 	data := poolGet(len(b))
 	copy(data, b)
-	wake := o.enqueueLocked(stage1Item{kind: itemMessage, data: data, maskPermit: permit}, charge)
+	wake := o.enqueueLocked(stage1Item{kind: itemMessage, data: data, maskPermit: permit})
 	o.mu.Unlock()
 	o.env.stats.messagesOut.Add(1)
 	o.env.stats.bytesOutRaw.Add(uint64(len(b)))
@@ -214,12 +236,14 @@ func (o *outbound) sendFrame(f *Frame) error {
 		return ErrCipherConflict // 显式失败，不静默降级成明文
 	}
 	// 广播的 backpressure 关心「这条连接要传多少字节」：按该帧的线路长度计入。
-	charge := len(f.wire) + o.cfg.wireSlack
-	if o.cfg.maxBuffer >= 0 && o.reservedWire+charge > o.cfg.maxBuffer {
+	if !o.admitLocked(len(f.wire) + o.cfg.wireSlack) {
 		o.mu.Unlock()
+		o.env.stats.sendQueueFull.Add(1)
 		return ErrSendQueueFull
 	}
-	wake := o.enqueueLocked(stage1Item{kind: itemFrame, frame: f}, charge)
+	o.env.stats.messagesOut.Add(1)
+	o.env.stats.bytesOutRaw.Add(uint64(len(f.wire)))
+	wake := o.enqueueLocked(stage1Item{kind: itemFrame, frame: f})
 	o.mu.Unlock()
 	if wake {
 		o.loop.maybeNotify()
@@ -243,11 +267,11 @@ func (o *outbound) sendFunc(n int, fill func([]byte) (int, error)) error {
 		return ErrMessageTooLarge
 	}
 	reserved := o.charge(n, o.tailCipher)
-	if o.cfg.maxBuffer >= 0 && o.reservedWire+reserved > o.cfg.maxBuffer {
+	if !o.admitLocked(reserved) {
 		o.mu.Unlock()
+		o.env.stats.sendQueueFull.Add(1)
 		return ErrSendQueueFull
 	}
-	o.reservedWire += reserved
 	o.mu.Unlock()
 	buf := poolGet(n)
 
@@ -257,7 +281,7 @@ func (o *outbound) sendFunc(n int, fill func([]byte) (int, error)) error {
 	// 3.【commit】重新加锁，此刻才线性化。
 	if err != nil || k < 0 || k > n {
 		o.mu.Lock()
-		o.reservedWire -= reserved
+		o.refundLocked(reserved)
 		o.mu.Unlock()
 		poolPut(buf)
 		switch {
@@ -275,18 +299,31 @@ func (o *outbound) sendFunc(n int, fill func([]byte) (int, error)) error {
 	}
 	o.mu.Lock()
 	if o.closing {
-		o.reservedWire -= reserved
+		o.refundLocked(reserved)
 		o.mu.Unlock()
 		poolPut(buf)
 		return ErrConnClosed // Close 不等待 fill；fill 期间关闭 ⇒ 不入队
 	}
-	// 按实际长度重算。tailCipher 可能已被队列里的 barrier 换掉——commit 在 barrier
-	// 之后线性化，编码用的就是新 cipher。差额可正可负：新 cipher 的 Overhead 更大时
-	// 会小幅超出 MaxBuffer，这是保守上界语义允许的（准入已在 reserve 时检查过）。
+	// 按实际长度重算。tailCipher 可能已被队列里的 barrier 换掉——commit 在
+	// barrier 之后线性化，编码用的就是新 cipher，所以长度上限要按**新** epoch
+	// 重查：否则 SendFunc 返回 nil，却在编码期因新 Overhead 越限而关掉整条连接。
+	if frameSize(k+cipherOverhead(o.tailCipher)) > o.cfg.maxMessage {
+		o.refundLocked(reserved)
+		o.mu.Unlock()
+		poolPut(buf)
+		return ErrMessageTooLarge
+	}
 	charge := o.charge(k, o.tailCipher)
-	o.reservedWire += charge - reserved
-	wake := o.enqueueLocked(stage1Item{kind: itemMessage, data: buf[:k], maskPermit: flagZ | flagC | flagE}, 0)
+	if delta := charge - reserved; delta > 0 {
+		o.reservedWire += delta
+		o.env.quota.acquire(delta) // 已过准入的消息不再拒绝，但账要平
+	} else {
+		o.refundLocked(-delta)
+	}
+	wake := o.enqueueLocked(stage1Item{kind: itemMessage, data: buf[:k], maskPermit: flagZ | flagC | flagE})
 	o.mu.Unlock()
+	o.env.stats.messagesOut.Add(1)
+	o.env.stats.bytesOutRaw.Add(uint64(k))
 	if wake {
 		o.loop.maybeNotify()
 	}
@@ -317,14 +354,17 @@ func (o *outbound) sendRaw(b []byte, force bool) error {
 		o.mu.Unlock()
 		return ErrConnClosed
 	}
-	if !force && o.cfg.maxBuffer >= 0 && o.reservedWire+len(b) > o.cfg.maxBuffer {
+	if force {
+		o.reservedWire += len(b) // 收尾帧豁免准入，但仍要计入账面
+		o.env.quota.acquire(len(b))
+	} else if !o.admitLocked(len(b)) {
 		o.mu.Unlock()
 		o.env.stats.sendQueueFull.Add(1)
 		return ErrSendQueueFull // 控制帧也吃准入：否则 ping 洪水可无限堆 pong
 	}
 	data := poolGet(len(b))
 	copy(data, b)
-	wake := o.enqueueLocked(stage1Item{kind: itemRaw, data: data}, len(b))
+	wake := o.enqueueLocked(stage1Item{kind: itemRaw, data: data})
 	o.mu.Unlock()
 	if wake {
 		o.loop.maybeNotify()
@@ -341,7 +381,7 @@ func (o *outbound) setCipher(ci Cipher) {
 		return
 	}
 	o.tailCipher = ci
-	wake := o.enqueueLocked(stage1Item{kind: itemCipherBarrier, cipher: ci}, 0)
+	wake := o.enqueueLocked(stage1Item{kind: itemCipherBarrier, cipher: ci})
 	o.mu.Unlock()
 	if wake {
 		o.loop.maybeNotify()
@@ -592,7 +632,7 @@ func (o *outbound) encodeItems(items []stage1Item) (err error) {
 	// 编码退还（第一段）：此刻 WS 封帧已完成，线路字节精确可知（06 预算模型）。
 	if refund := charged - e.outBytes; refund != 0 {
 		o.mu.Lock()
-		o.reservedWire -= refund
+		o.refundLocked(refund)
 		o.mu.Unlock()
 	}
 	return nil
@@ -701,7 +741,7 @@ func (o *outbound) write() (writeStatus, error) {
 			o.env.stats.bytesOut.Add(uint64(n))
 			o.advance(n)
 			o.mu.Lock()
-			o.reservedWire -= n // 写出退还（第二段）
+			o.refundLocked(n) // 写出退还（第二段）
 			o.mu.Unlock()
 			if o.progress != nil {
 				o.progress() // lastProgress：stall LRU 移尾
@@ -750,7 +790,7 @@ func (o *outbound) discard() {
 	o.closing = true
 	items := o.q1
 	o.q1, o.q1spare = nil, nil
-	o.reservedWire = 0
+	o.refundLocked(o.reservedWire) // 丢弃队列：账面与配额一起清零
 	o.mu.Unlock()
 
 	o.releaseItems(items)
