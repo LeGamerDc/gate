@@ -126,6 +126,9 @@ type loop struct {
 	// 进程还在，OnClose 就该补上）。
 	pendingCloses int
 
+	// nconns 是本 loop 当前挂着的连接数（含握手期），attach/detach 成对维护。
+	// 生产路径不读它——跨 loop 的负载均衡要的是原子量，用的是 stats.connsOpen；
+	// 它的用处是收尾配平断言（07 L3：拆完之后必须回到 0）。
 	nconns int
 }
 
@@ -807,7 +810,6 @@ func (l *loop) finishClose(c *connCore) {
 		c.pendingClose = false
 		l.pendingCloses--
 	}
-	defer c.finalize()
 	if !c.opened || c.cb.onClose == nil {
 		return
 	}
@@ -817,13 +819,4 @@ func (l *loop) finishClose(c *connCore) {
 		}
 	}()
 	c.cb.onClose(c.closeReason())
-}
-
-// finalize 是连接生命周期的最后一步，Closed 之后恰好一次。
-func (c *connCore) finalize() {
-	if c.onFinalized != nil {
-		fn := c.onFinalized
-		c.onFinalized = nil
-		fn()
-	}
 }

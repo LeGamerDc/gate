@@ -110,9 +110,8 @@ type connCore struct {
 
 	// hsCtx 是握手期（Accepted/Proxy/Handshaking）的装配层临时状态，
 	// 进入 Open 时清空；非 nil 也意味着「还没成为业务可见的连接」。
-	hsCtx       any
-	hsCounted   bool   // 已计入 MaxHandshaking（释放点认这个标志，不认状态）
-	onFinalized func() // Closed 之后的最后一步（server 的 live 计数）
+	hsCtx     any
+	hsCounted bool // 已计入 MaxHandshaking（释放点认这个标志，不认状态）
 
 	// 读闸 / 异步（串行域）
 	pauseDepth   int

@@ -138,6 +138,8 @@ bug** 的复查，判据是这套文档一贯的那条：**靠纪律维持的不
 | `MaxConns` / `MaxHandshaking` 的原子占位写成 `limit > 0 && n.Add(1) > limit ... else if limit <= 0 { n.Add(1) }`：正确性押在短路求值上 | 任何一次「顺手理顺」这个条件 | `reserveSlot(n, limit)` |
 | `detach` 里 `pauseLRU` 被直接 `remove` 一次，而链表归属与 `ConnsPaused` 计数本该由 `enterPaused`/`exitPaused` 成对结清 | 下一次改暂停计数 | 只留 `exitPaused` 一个出口 |
 | `reasonSet` 写而不读（真正兑现「第一个 reason 生效」的是 `beginClose` 的临界区）；`closeSend` 只给测试用却编译进生产包 | 有人照着 `reasonSet` 的注释去判断「reason 已定」；有人在生产路径上顺手用 `closeSend`，丢掉 reason | 删；`closeSend` 移进 `_test.go` |
+| `Server.live` 与它背后的 `onFinalized` / `finalize()` 整套机制写而不读——它是「`Shutdown` 等 `OnClose`」那次**方向修反了的修复**被撤销后的残留，注释还写着「`Shutdown` 等的是它」 | 下一次有人照着这条注释去理解 `Shutdown` 的等待对象 | 整套删掉。顺带省掉每连接一次闭包分配（`func(){ s.live.Add(-1) }`）——在 10 万连接的目标下这不是整洁问题 |
+| `Server.waitErr` 从来没有被赋值过，`Wait` / `Shutdown` 恒返回 `nil` | 调用方拿 `Shutdown` 的返回值判断「优雅关闭成功了吗」，而它永远说成功 | 删字段；`Shutdown` 走强拆路径时返回 `ctx.Err()`，那个 `error` 返回值从此有意义。`Wait` 的返回值明确注明是预留的 |
 | `buildFrameAAD` 与 `buildFrame` 一对双胞胎，逃逸分析的绕法出现在每个调用点 | —（可读性） | 实现只剩 `buildFrameInto`，热路径走 `outbound.buildFrame` |
 
 同一轮还扫掉了几处**与代码说反的注释**——它们比没有注释更糟，因为下一次修复会

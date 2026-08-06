@@ -64,9 +64,8 @@ func TestSoakMixedChurn(t *testing.T) {
 	if st.OutboundQueued != 0 || st.PendingInbound != 0 || st.ConnsOverHighWater != 0 || st.ConnsPaused != 0 {
 		t.Fatalf("水位未归零: %+v", st)
 	}
-	if env.srv.live.Load() != 0 || env.srv.conns.Load() != 0 || env.srv.handshaking.Load() != 0 {
-		t.Fatalf("计数未归零: live=%d conns=%d hs=%d",
-			env.srv.live.Load(), env.srv.conns.Load(), env.srv.handshaking.Load())
+	if env.srv.conns.Load() != 0 || env.srv.handshaking.Load() != 0 {
+		t.Fatalf("计数未归零: conns=%d hs=%d", env.srv.conns.Load(), env.srv.handshaking.Load())
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

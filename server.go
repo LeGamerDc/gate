@@ -45,8 +45,7 @@ type Server[S any] struct {
 	lns   []int // listener fds
 	addr  netip.AddrPort
 
-	conns       atomic.Int64 // MaxConns 的准入占位；拆除（fd 归还）时释放
-	live        atomic.Int64 // 尚未走完 OnClose 的连接；Shutdown 等的是它
+	conns       atomic.Int64 // MaxConns 的准入占位；拆除（fd 归还）时释放，Shutdown 等的是它
 	handshaking atomic.Int64 // MaxHandshaking 同理
 
 	budget *serverBudget // MaxOutboundBytes：各 loop 按租约分配（近似口径）
@@ -54,10 +53,9 @@ type Server[S any] struct {
 	frameMu  sync.Mutex
 	frameEnc *zstd.Encoder // NewFrame 专用（冷路径，锁保护）
 
-	closed  atomic.Bool
-	done    chan struct{}
-	wg      sync.WaitGroup
-	waitErr error
+	closed atomic.Bool
+	done   chan struct{}
+	wg     sync.WaitGroup
 }
 
 // hsContext 是握手期（Accepted/Proxy/Handshaking）的临时状态，
@@ -202,9 +200,12 @@ func (s *Server[S]) Addr() netip.AddrPort { return s.addr }
 // Wait 阻塞到 server 完全收尾：不只是 socket 拆除（那是 Shutdown 的返回点），
 // 还包括给带在途 AsyncDo 的连接补上的最后一次 OnClose。业务任务永不返回时
 // 它也不会返回——那需要业务自己的 context 收敛（01「ctx 约束的是什么」）。
+//
+// 目前恒返回 nil：事件循环没有能让整个 server 失败的错误路径。返回值留在
+// 签名里是给将来那种错误用的，别把它当成「没出问题」的判据。
 func (s *Server[S]) Wait() error {
 	<-s.done
-	return s.waitErr
+	return nil
 }
 
 // Stats 返回全 server 汇总（各 loop 计数器求和）。
@@ -250,10 +251,14 @@ func (s *Server[S]) NewFrame(payload []byte, opts ...FrameOption) (*Frame, error
 
 // Shutdown 优雅关闭：停止 accept → 每条连接尽力 flush 后 OnClose(ErrServerClosed)
 // → 全部关闭后返回。ctx 到期则放弃剩余 flush 直接关闭。幂等。
+//
+// 返回 ctx.Err() 表示**优雅的那一半没做完**：剩余 flush 被放弃、连接是被强拆的。
+// socket 无论如何都已经拆干净（或已尽最大努力，见日志）。重复调用等到收尾后返回
+// nil——它没有参与那次关闭，报不出它的结果。
 func (s *Server[S]) Shutdown(ctx context.Context) error {
 	if !s.closed.CompareAndSwap(false, true) {
 		<-s.done
-		return s.waitErr
+		return nil
 	}
 	// 1. 停止 accept：listener 只在此刻统一关闭（运行期关闭会让内核丢掉
 	// 已排队未 accept 的连接——所以运行期绝不动它）。
@@ -320,6 +325,9 @@ drain:
 		s.wg.Wait()
 		close(s.done)
 	}()
+	if forced {
+		return ctx.Err() // 强拆过：告诉调用方优雅的那一半没做完
+	}
 	return nil
 }
 
@@ -473,8 +481,6 @@ func (s *Server[S]) registerConn(l *loop, nfd int, remote netip.AddrPort) {
 		s.log.Warn("gate: register conn", zap.Error(err))
 		return
 	}
-	s.live.Add(1)
-	c.onFinalized = func() { s.live.Add(-1) }
 	c.hsCtx = &hsContext[S]{srv: s, remote: remote, id: l.nextConnID()}
 
 	needProxy := s.opts.Proxy != ProxyOff
