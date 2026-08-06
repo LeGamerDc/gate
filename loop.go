@@ -203,11 +203,12 @@ func (l *loop) attach(fd int, cb coreCallbacks) (*connCore, error) {
 	c.tnode.c, c.snode.c, c.lnode.c = c, c, c
 	c.gateSink = func(msg []byte, _ bool) error {
 		l.stats.messagesIn.Add(1)
-		if cbErr := c.cb.onMessage(msg); cbErr != nil {
+		cbErr := c.cb.onMessage(msg)
+		// 回调返回点：无论成功还是 error，已注册的 AsyncDo 都要启动
+		// （panic 出口由 connReadable / processCarry 的屏障兜住）。
+		l.launchAsync(c)
+		if cbErr != nil {
 			return handlerErr{cbErr}
-		}
-		if c.asyncFn != nil {
-			l.launchAsync(c) // AsyncDo 的 goroutine 在当次回调返回之后启动
 		}
 		return nil
 	}
@@ -234,10 +235,13 @@ func (l *loop) openConn(c *connCore) {
 
 	var openErr error
 	func() {
+		// AsyncDo 的启动点在 defer 里：OnOpen 返回 error 或 panic 时，
+		// 已注册的任务同样必须启动，否则它会永久悬空。
 		defer func() {
 			if r := recover(); r != nil {
 				openErr = fmt.Errorf("%w: OnOpen: %v", ErrHandlerPanic, r)
 			}
+			l.launchAsync(c)
 		}()
 		if c.cb.onOpen != nil {
 			openErr = c.cb.onOpen()
@@ -249,11 +253,10 @@ func (l *loop) openConn(c *connCore) {
 	}
 	c.opened = true
 	l.stats.connsOpen.Add(1)
-	l.idleLRU.pushBack(&c.tnode, l.now())
-	// OnOpen 里可能 Send 了 welcome（inLoop 之外的直接调用会自行 arm）；
-	// 也可能调了 AsyncDo——回调返回点在这里。
-	if c.asyncFn != nil {
-		l.launchAsync(c)
+	// OnOpen 里可能 Pause / AsyncDo 过：那时 tnode 已经在 pause 链上，
+	// 再挂一次 idle 链会让同一个侵入式节点同时属于两条链。
+	if c.pauseDepth == 0 {
+		l.idleLRU.pushBack(&c.tnode, l.now())
 	}
 }
 
@@ -442,6 +445,7 @@ func (l *loop) connReadable(c *connCore) {
 		if r := recover(); r != nil {
 			l.closeLocal(c, fmt.Errorf("%w: %v", ErrHandlerPanic, r))
 		}
+		l.launchAsync(c) // panic 出口：已注册的 AsyncDo 仍要启动
 	}()
 	if c.state != stateOpen {
 		if l.onHsRead != nil && (c.state == stateProxy || c.state == stateHandshaking) {
@@ -627,6 +631,7 @@ func (l *loop) processCarry(c *connCore) {
 		if r := recover(); r != nil {
 			l.closeLocal(c, fmt.Errorf("%w: %v", ErrHandlerPanic, r))
 		}
+		l.launchAsync(c) // panic 出口：已注册的 AsyncDo 仍要启动
 	}()
 	c.out.beginInLoop()
 	defer l.flushBatchEnd(c)
@@ -730,9 +735,7 @@ func (l *loop) detach(c *connCore) {
 	if c.opened {
 		l.stats.connsOpen.Add(-1)
 	}
-	if c.pauseDepth > 0 {
-		l.stats.connsPaused.Add(-1)
-	}
+	c.exitPaused(l) // 读闸的链表归属与计数在这里一次结清（幂等）
 	if l.onConnClosed != nil {
 		l.onConnClosed(c)
 	}

@@ -28,7 +28,12 @@ func (l *lruList) front() *lruNode {
 	return l.root.next
 }
 
+// pushBack 先摘再挂：同一个侵入式节点同时属于两条链会直接覆盖指针，
+// 把两条链一起毁掉。这里的 remove 对「不在任何链上」是 no-op，
+// 但注意它只能摘掉**本链**的归属——跨链的互斥仍由调用方保证
+// （enterPaused/exitPaused），这一行只是最后一道结构性防御。
 func (l *lruList) pushBack(n *lruNode, when int64) {
+	l.remove(n)
 	n.when = when
 	n.prev = l.root.prev
 	n.next = &l.root
