@@ -203,8 +203,7 @@ func (l *loop) wsHsReadable(c *connCore, opts *WebSocketOptions, done func(hs *H
 		c.in.carry = nil
 		leftover := carry[reqEnd:]
 
-		c.ws = &wsState{}
-		c.cb.onDrain = wsOnDrain(c)
+		enableWS(c)
 		if done != nil {
 			done(hs)
 		}

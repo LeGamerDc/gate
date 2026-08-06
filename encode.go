@@ -54,6 +54,14 @@ func (b *builtFrame) release() {
 //     Send 在准入时已按 frameSize(len+Overhead) 检查过，这里越限说明 gate
 //     自身有 bug，返回 ErrMessageTooLarge 由调用方关连接，绝不写错帧上线路。
 func buildFrame(data []byte, flags byte, enc *zstd.Encoder, tryCompress bool, ci Cipher, maxWire int) (builtFrame, error) {
+	var scratch [maxHeaderSize]byte
+	return buildFrameAAD(data, flags, enc, tryCompress, ci, maxWire, &scratch)
+}
+
+// buildFrameAAD 是热路径变体：aad 头先写进调用方提供的长命 scratch
+// （outbound 传每 loop 的 env.aadHdr）。把 f.hdr 直接切给接口方法 Seal
+// 会让整个 builtFrame 按逃逸分析上堆——每帧一次 48B 分配。
+func buildFrameAAD(data []byte, flags byte, enc *zstd.Encoder, tryCompress bool, ci Cipher, maxWire int, scratch *[maxHeaderSize]byte) (builtFrame, error) {
 	var f builtFrame
 	body := data
 
@@ -75,12 +83,13 @@ func buildFrame(data []byte, flags byte, enc *zstd.Encoder, tryCompress bool, ci
 			f.release()
 			return builtFrame{}, ErrMessageTooLarge
 		}
-		f.hdrLen = putHeader(f.hdr[:], wire, flags)
+		f.hdrLen = putHeader(scratch[:], wire, flags)
+		f.hdr = *scratch
 		if ci.Overhead() == 0 {
-			body = ci.Seal(body[:0], body, f.hdr[:f.hdrLen])
+			body = ci.Seal(body[:0], body, scratch[:f.hdrLen])
 		} else {
 			dst := poolGet(wire)[:0]
-			sealed := ci.Seal(dst, body, f.hdr[:f.hdrLen])
+			sealed := ci.Seal(dst, body, scratch[:f.hdrLen])
 			if f.bodyPooled {
 				poolPut(body[:0])
 			}

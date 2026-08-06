@@ -200,6 +200,16 @@ func (l *loop) attach(fd int, cb coreCallbacks) (*connCore, error) {
 		}
 	}
 	c.tnode.c, c.snode.c, c.lnode.c = c, c, c
+	c.gateSink = func(msg []byte, _ bool) error {
+		l.stats.messagesIn.Add(1)
+		if cbErr := c.cb.onMessage(msg); cbErr != nil {
+			return handlerErr{cbErr}
+		}
+		if c.asyncFn != nil {
+			l.launchAsync(c) // AsyncDo 的 goroutine 在当次回调返回之后启动
+		}
+		return nil
+	}
 
 	idx, gen := l.allocSlot(c)
 	c.slotIdx, c.gen = idx, gen
@@ -559,16 +569,7 @@ func (l *loop) parseAndDeliver(c *connCore, data []byte) bool {
 type handlerErr struct{ error }
 
 func (l *loop) deliverFrame(c *connCore, f frame) {
-	err := c.cdc.deliver(f, c.ciph, nil, func(msg []byte, _ bool) error {
-		l.stats.messagesIn.Add(1)
-		if cbErr := c.cb.onMessage(msg); cbErr != nil {
-			return handlerErr{cbErr}
-		}
-		if c.asyncFn != nil {
-			l.launchAsync(c) // AsyncDo 的 goroutine 在当次回调返回之后启动
-		}
-		return nil
-	})
+	err := c.cdc.deliver(f, c.ciph, nil, c.gateSink)
 	if err != nil {
 		var he handlerErr
 		if errors.As(err, &he) {

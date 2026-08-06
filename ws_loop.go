@@ -15,6 +15,9 @@ var errWSStop = errors.New("gate/ws: stop feeding")
 func enableWS(c *connCore) {
 	c.ws = &wsState{}
 	c.cb.onDrain = wsOnDrain(c)
+	l := c.loop
+	c.wsEmitFn = func(seg []byte) error { return l.wsGateFeed(c, seg) }
+	c.wsCtrlFn = func(op byte, payload []byte) error { return l.wsCtrl(c, op, payload) }
 }
 
 // wsOnDrain 是进入 Draining 时的钩子：按 reason 决定发不发 close 帧（W10）。
@@ -59,10 +62,7 @@ func (l *loop) wsReadable(c *connCore) {
 
 // wsFeed 把一段原始字节推进 WS 帧层。返回 false 表示本轮到此为止。
 func (l *loop) wsFeed(c *connCore, raw []byte) bool {
-	err := c.ws.feed(raw,
-		func(seg []byte) error { return l.wsGateFeed(c, seg) },
-		func(op byte, payload []byte) error { return l.wsCtrl(c, op, payload) },
-	)
+	err := c.ws.feed(raw, c.wsEmitFn, c.wsCtrlFn)
 	if err != nil {
 		if !errors.Is(err, errWSStop) {
 			l.closeLocal(c, wrapProtocol(err))

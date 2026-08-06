@@ -81,6 +81,12 @@ type connCore struct {
 	curInterest interest // 当前 poller 兴趣（边沿动作：只在变化时 mod）
 	carryQueued bool     // 已在 loop 的 carryQ 里
 
+	// 热路径闭包预建（attach/enableWS 时装配）：每帧/每段新建闭包会把
+	// 「入站零堆分配」打破成每消息一次分配。
+	gateSink func(msg []byte, owned bool) error
+	wsEmitFn func(seg []byte) error
+	wsCtrlFn func(op byte, payload []byte) error
+
 	// closing 可从任意 goroutine 置位（Close 幂等，第一个 reason 生效）。
 	closing atomic.Bool
 	mu      sync.Mutex // 只保护 reason

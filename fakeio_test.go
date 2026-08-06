@@ -12,6 +12,7 @@ import (
 // 并记录完整字节流水供逐字节一致断言。
 type fakeIO struct {
 	wrote      bytes.Buffer
+	discard    bool     // 基准测试：不记录流水（防 wrote 无界增长干扰分配计数）
 	script     []ioStep // 每次 writev 消费一步；耗尽后全收
 	writevN    int
 	readScript []readStep
@@ -49,7 +50,9 @@ func (f *fakeIO) writev(_ int, vec [][]byte) (int, error) {
 			break
 		}
 		k := min(remain, len(b))
-		f.wrote.Write(b[:k])
+		if !f.discard {
+			f.wrote.Write(b[:k])
+		}
 		remain -= k
 	}
 	return n, step.err
@@ -106,7 +109,11 @@ func (l *fakeLoop) drainDirty() writeStatus {
 	st := writeIdle
 	for len(l.dirty) > 0 {
 		o := l.dirty[0]
-		l.dirty = l.dirty[1:]
+		if len(l.dirty) == 1 {
+			l.dirty = l.dirty[:0] // 复用底层数组（零分配基准依赖这一点）
+		} else {
+			l.dirty = l.dirty[1:]
+		}
 		st = o.flush(true, false)
 	}
 	return st

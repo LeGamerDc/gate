@@ -419,73 +419,91 @@ func (o *outbound) flush(clearArmed, clearInLoop bool) writeStatus {
 // panic 屏障放在这个批边界（01「panic 屏障放在批边界」）：Cipher 的 Seal 在
 // 这里被逐帧调用，屏障一批一次而不是一帧一次。任何失败（含 panic）都在返回前
 // 释放已生成的 seg 与未消费的 items——之后由调用方走 failLoop。
+// encCtx 是一批编码的段落状态。显式结构体而不是闭包——闭包环境每批一次
+// 堆分配，会把「出站 flush 零堆分配」打破。
+type encCtx struct {
+	o                *outbound
+	outHead, outTail *chunk // 本批最终追加到 stage 2 的链
+	outBytes         int
+	segHead, segTail *chunk // 当前 gate 帧段落
+	segBytes         int
+}
+
+func (e *encCtx) appendOut(head, tail *chunk, n int) {
+	if head == nil {
+		return
+	}
+	if e.outTail == nil {
+		e.outHead, e.outTail = head, tail
+	} else {
+		e.outTail.next = head
+		e.outTail = tail
+	}
+	e.outBytes += n
+}
+
+// closeSeg 结束当前 gate 段落：WS 模式下前插一个封帧头 chunk（O12/W7）。
+func (e *encCtx) closeSeg() {
+	if e.segHead == nil {
+		return
+	}
+	if e.o.cfg.wsWrap != nil {
+		h := e.o.env.slab.get()
+		h.kind = chunkInline
+		h.n = int32(e.o.cfg.wsWrap(e.segBytes, h.hdr[:]))
+		h.next = e.segHead
+		e.segHead = h
+		e.segBytes += int(h.n)
+	}
+	e.appendOut(e.segHead, e.segTail, e.segBytes)
+	e.segHead, e.segTail, e.segBytes = nil, nil, 0
+}
+
+func (e *encCtx) appendChunk(c *chunk) {
+	if e.segTail == nil {
+		e.segHead, e.segTail = c, c
+	} else {
+		e.segTail.next = c
+		e.segTail = c
+	}
+	e.segBytes += int(c.n)
+}
+
+func (e *encCtx) releaseAll() {
+	e.closeSeg()
+	for c := e.outHead; c != nil; {
+		next := c.next
+		c.release()
+		e.o.env.slab.put(c)
+		c = next
+	}
+	e.outHead, e.outTail, e.outBytes = nil, nil, 0
+}
+
+func clusterableItem(it *stage1Item) bool {
+	return it.kind == itemMessage && it.maskPermit&flagC != 0 && it.maskAlready == 0
+}
+
 func (o *outbound) encodeItems(items []stage1Item) (err error) {
 	// out*：本批最终追加到 stage 2 的链；seg*：当前 gate 帧段落。
 	// 原始段（itemRaw）会结束当前段落——WS 封帧只包 gate 帧，101 响应与
 	// WS 控制帧原样出线，但仍在同一条 FIFO 上（W13）。
-	var outHead, outTail *chunk
-	outBytes := 0
-	var segHead, segTail *chunk
-	segBytes := 0
+	//
+	// panic 屏障放在这个批边界（01「panic 屏障放在批边界」）：Cipher 的 Seal
+	// 在这里被逐帧调用，屏障一批一次而不是一帧一次。任何失败（含 panic）都在
+	// 返回前释放已生成的链与未消费的 items——之后由调用方走 failLoop。
+	e := encCtx{o: o}
 	charged := 0
-
-	appendOut := func(head, tail *chunk, n int) {
-		if head == nil {
-			return
-		}
-		if outTail == nil {
-			outHead, outTail = head, tail
-		} else {
-			outTail.next = head
-			outTail = tail
-		}
-		outBytes += n
-	}
-	// closeSeg 结束当前 gate 段落：WS 模式下前插一个封帧头 chunk（O12/W7）。
-	closeSeg := func() {
-		if segHead == nil {
-			return
-		}
-		if o.cfg.wsWrap != nil {
-			h := o.env.slab.get()
-			h.kind = chunkInline
-			h.n = int32(o.cfg.wsWrap(segBytes, h.hdr[:]))
-			h.next = segHead
-			segHead = h
-			segBytes += int(h.n)
-		}
-		appendOut(segHead, segTail, segBytes)
-		segHead, segTail, segBytes = nil, nil, 0
-	}
 
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("%w: cipher/encode: %v", ErrHandlerPanic, r)
 		}
 		if err != nil {
-			closeSeg()
-			for c := outHead; c != nil; {
-				next := c.next
-				c.release()
-				o.env.slab.put(c)
-				c = next
-			}
+			e.releaseAll()
 			o.releaseItems(items)
 		}
 	}()
-
-	appendChunk := func(c *chunk) {
-		if segTail == nil {
-			segHead, segTail = c, c
-		} else {
-			segTail.next = c
-			segTail = c
-		}
-		segBytes += int(c.n)
-	}
-	clusterable := func(it stage1Item) bool {
-		return it.kind == itemMessage && it.maskPermit&flagC != 0 && it.maskAlready == 0
-	}
 
 	i := 0
 	for i < len(items) {
@@ -498,10 +516,10 @@ func (o *outbound) encodeItems(items []stage1Item) (err error) {
 
 		case itemRaw:
 			charged += len(it.data)
-			closeSeg()
+			e.closeSeg()
 			c := o.env.slab.get()
 			c.kind, c.buf, c.n = chunkPooled, it.data, int32(len(it.data))
-			appendOut(c, c, int(c.n))
+			e.appendOut(c, c, int(c.n))
 			items[i].data = nil
 			i++
 
@@ -510,17 +528,17 @@ func (o *outbound) encodeItems(items []stage1Item) (err error) {
 			o.env.stats.framesOut.Add(1)
 			c := o.env.slab.get()
 			c.kind, c.buf, c.n, c.frame = chunkFrame, it.frame.wire, int32(len(it.frame.wire)), it.frame
-			appendChunk(c)
+			e.appendChunk(c)
 			items[i].frame = nil
 			i++
 
 		case itemMessage:
-			if o.cfg.maxCluster > 0 && clusterable(it) {
+			if o.cfg.maxCluster > 0 && clusterableItem(&it) {
 				// 分组上限再夹掉当前 cipher 的 Overhead：构造时夹不掉它——
 				// cipher 是运行时换的，而 body+Overhead 不能越协议上限。
 				limit := min(o.cfg.maxCluster, maxMessageSize-cipherOverhead(o.encCipher))
 				j, size := i, 0
-				for j < len(items) && clusterable(items[j]) {
+				for j < len(items) && clusterableItem(&items[j]) {
 					fs := frameSize(len(items[j].data))
 					if j > i && size+fs > limit {
 						break
@@ -529,14 +547,14 @@ func (o *outbound) encodeItems(items []stage1Item) (err error) {
 					j++
 				}
 				if j-i >= 2 {
-					if err := o.encodeCompound(items[i:j], size, &charged, appendChunk); err != nil {
+					if err := o.encodeCompound(items[i:j], size, &charged, &e); err != nil {
 						return err
 					}
 					i = j
 					continue
 				}
 			}
-			if err := o.encodeSingle(it, &charged, appendChunk); err != nil {
+			if err := o.encodeSingle(it, &charged, &e); err != nil {
 				return err
 			}
 			items[i].data = nil // 所有权已移交 chunk（或已在替换时归还池）
@@ -544,19 +562,19 @@ func (o *outbound) encodeItems(items []stage1Item) (err error) {
 		}
 	}
 
-	closeSeg()
-	if outHead != nil {
+	e.closeSeg()
+	if e.outHead != nil {
 		if o.tail == nil {
-			o.head, o.tail = outHead, outTail
+			o.head, o.tail = e.outHead, e.outTail
 		} else {
-			o.tail.next = outHead
-			o.tail = outTail
+			o.tail.next = e.outHead
+			o.tail = e.outTail
 		}
-		o.stage2Bytes += outBytes
+		o.stage2Bytes += e.outBytes
 	}
 
 	// 编码退还（第一段）：此刻 WS 封帧已完成，线路字节精确可知（06 预算模型）。
-	if refund := charged - outBytes; refund != 0 {
+	if refund := charged - e.outBytes; refund != 0 {
 		o.mu.Lock()
 		o.reservedWire -= refund
 		o.mu.Unlock()
@@ -564,7 +582,7 @@ func (o *outbound) encodeItems(items []stage1Item) (err error) {
 	return nil
 }
 
-func (o *outbound) encodeSingle(it stage1Item, charged *int, appendChunk func(*chunk)) error {
+func (o *outbound) encodeSingle(it stage1Item, charged *int, e *encCtx) error {
 	*charged += o.charge(len(it.data), o.encCipher)
 
 	var ci Cipher
@@ -573,18 +591,18 @@ func (o *outbound) encodeSingle(it stage1Item, charged *int, appendChunk func(*c
 	}
 	tryCompress := it.maskPermit&flagZ != 0 && it.maskAlready == 0 &&
 		o.cfg.compressThreshold > 0 && len(it.data) > o.cfg.compressThreshold
-	bf, err := buildFrame(it.data, it.maskAlready, o.encoderIf(tryCompress), tryCompress, ci, maxMessageSize)
+	bf, err := buildFrameAAD(it.data, it.maskAlready, o.encoderIf(tryCompress), tryCompress, ci, maxMessageSize, &o.env.aadHdr)
 	if err != nil {
 		return err
 	}
 	if bf.bodyPooled {
 		poolPut(it.data) // 原文已被压缩/AEAD 输出替换
 	}
-	o.pushFrameChunks(&bf, appendChunk)
+	o.pushFrameChunks(&bf, e)
 	return nil
 }
 
-func (o *outbound) encodeCompound(group []stage1Item, size int, charged *int, appendChunk func(*chunk)) error {
+func (o *outbound) encodeCompound(group []stage1Item, size int, charged *int, e *encCtx) error {
 	for gi := range group {
 		*charged += o.charge(len(group[gi].data), o.encCipher)
 	}
@@ -596,7 +614,7 @@ func (o *outbound) encodeCompound(group []stage1Item, size int, charged *int, ap
 	}
 	// 02：compound 按整批字节数与阈值比较（>=）。
 	tryCompress := o.cfg.compressThreshold > 0 && size >= o.cfg.compressThreshold
-	bf, err := buildFrame(body, flagC, o.encoderIf(tryCompress), tryCompress, o.encCipher, maxMessageSize)
+	bf, err := buildFrameAAD(body, flagC, o.encoderIf(tryCompress), tryCompress, o.encCipher, maxMessageSize, &o.env.aadHdr)
 	if err != nil {
 		poolPut(body)
 		return err
@@ -604,7 +622,7 @@ func (o *outbound) encodeCompound(group []stage1Item, size int, charged *int, ap
 	if bf.bodyPooled {
 		poolPut(body)
 	}
-	o.pushFrameChunks(&bf, appendChunk)
+	o.pushFrameChunks(&bf, e)
 	return nil
 }
 
@@ -617,18 +635,18 @@ func (o *outbound) encoderIf(need bool) *zstd.Encoder {
 
 // pushFrameChunks 把 builtFrame 落成 inline(帧头) + pooled(body) 两个 chunk。
 // 帧头内联在 chunk 节点里——它是持久线路字节，必须活到该 chunk 完全写出（O12）。
-func (o *outbound) pushFrameChunks(bf *builtFrame, appendChunk func(*chunk)) {
+func (o *outbound) pushFrameChunks(bf *builtFrame, e *encCtx) {
 	o.env.stats.framesOut.Add(1)
 	h := o.env.slab.get()
 	h.kind = chunkInline
 	copy(h.hdr[:], bf.hdr[:bf.hdrLen])
 	h.n = int32(bf.hdrLen)
-	appendChunk(h)
+	e.appendChunk(h)
 
 	if len(bf.body) > 0 {
 		p := o.env.slab.get()
 		p.kind, p.buf, p.n = chunkPooled, bf.body, int32(len(bf.body))
-		appendChunk(p)
+		e.appendChunk(p)
 	} else {
 		// 空消息：没有字节就不占 chunk，但池借的零长缓冲要还。
 		poolPut(bf.body)
