@@ -121,21 +121,40 @@ type loop struct {
 	backoffCur   int64           // EMFILE 指数退避当前值（纳秒）
 	stop         atomic.Bool     // Shutdown 置位
 
+	// pendingCloses：已 Detached、等在途 AsyncDo 结束才能补 OnClose 的连接数。
+	// loop 在 stop 之后仍要活到它归零（01：Shutdown 不等这些任务，但只要
+	// 进程还在，OnClose 就该补上）。
+	pendingCloses int
+
 	nconns int
 }
 
-// run 驱动循环直到 stop 置位。退出前关闭 poller。
+// run 驱动循环直到 stop 置位**且**没有等着补 OnClose 的连接。
+//
+// 后半个条件兑现 01 的承诺：「在途的 AsyncDo 不会被 Shutdown 等待——
+// 这些连接的 socket 会被正常拆除，但它们的 OnClose 要等各自的 f 结束后
+// 才触发；进程先退出的话就不触发了」。socket 早已拆完（Shutdown 等的就是
+// 那个），这里只是让 loop 多活一会儿去送最后一次回调。
 func (l *loop) run() {
-	for !l.stop.Load() {
+	for !l.stop.Load() || l.pendingCloses > 0 {
 		l.step()
 	}
-	// 退出前把还挂在本 loop 上的连接拆干净。强制 Shutdown 到点时可能仍有
-	// 连接没走完拆除序列，而 fd 只能由 loop 线程关（R2）——这里是最后机会。
+	// 退出前收干净。fd 只能由 loop 线程关（R2），这里是最后机会：
+	//  1. 排空收件箱——里面可能有还没执行的「注册新连接」闭包（它会看到
+	//     server 已关闭并把 fd 关掉），以及关闭 listener 的闭包；
+	//  2. 拆掉仍挂在本 loop 上的连接（强制 Shutdown 到点时可能没走完序列）；
+	//  3. 关掉 listener 与 EMFILE 预留 fd。
+	l.processInbox()
 	for i := range l.slots {
 		if c := l.slots[i].c; c != nil {
 			l.closeLocal(c, ErrServerClosed)
 			l.detach(c)
 		}
+	}
+	if l.listener >= 0 {
+		_ = l.p.del(l.listener)
+		_ = unixClose(l.listener)
+		l.listener = -1
 	}
 	if l.reserveFd >= 0 {
 		_ = unixClose(l.reserveFd)
@@ -213,12 +232,14 @@ func (l *loop) attach(fd int, cb coreCallbacks) (*connCore, error) {
 	c.gateSink = func(msg []byte, _ bool) error {
 		l.stats.messagesIn.Add(1)
 		cbErr := c.cb.onMessage(msg)
-		// 回调返回点：无论成功还是 error，已注册的 AsyncDo 都要启动
-		// （panic 出口由 connReadable / processCarry 的屏障兜住）。
-		l.launchAsync(c)
+		// 回调返回点。成功 ⇒ 启动已注册的 AsyncDo；返回 error（连接要关）
+		// ⇒ 取消它，不做一次注定没用的 RPC（01 D18）。panic 出口由
+		// connReadable / processCarry 的屏障按同样规则处理。
 		if cbErr != nil {
+			l.cancelAsync(c)
 			return handlerErr{cbErr}
 		}
+		l.launchAsync(c)
 		return nil
 	}
 
@@ -250,7 +271,11 @@ func (l *loop) openConn(c *connCore) {
 			if r := recover(); r != nil {
 				openErr = fmt.Errorf("%w: OnOpen: %v", ErrHandlerPanic, r)
 			}
-			l.launchAsync(c)
+			if openErr != nil {
+				l.cancelAsync(c) // 连接要关：不启动已注册的任务（01 D18）
+			} else {
+				l.launchAsync(c)
+			}
 		}()
 		if c.cb.onOpen != nil {
 			openErr = c.cb.onOpen()
@@ -457,8 +482,10 @@ func (l *loop) connReadable(c *connCore) {
 	defer func() {
 		if r := recover(); r != nil {
 			l.closeLocal(c, fmt.Errorf("%w: %v", ErrHandlerPanic, r))
+			l.cancelAsync(c) // 连接要关：不启动已注册的任务（01 D18）
+			return
 		}
-		l.launchAsync(c) // panic 出口：已注册的 AsyncDo 仍要启动
+		l.launchAsync(c) // 正常出口的兜底（gateSink 已处理逐条的情形）
 	}()
 	if c.state != stateOpen {
 		if l.onHsRead != nil && (c.state == stateProxy || c.state == stateHandshaking) {
@@ -622,6 +649,30 @@ func (l *loop) deliverFrameBuf(c *connCore, body []byte) {
 	}
 }
 
+// appendCarry 把 seg 追加到 carry 尾部（容量不够时按翻倍换一块更大的），
+// 并施加 MaxPending 封顶。摊还 O(1)——与「每次重新合并整段」相对，
+// 后者在预算耗尽后会退化成 O(n²)。
+func (l *loop) appendCarry(c *connCore, seg []byte) {
+	if len(seg) == 0 {
+		return
+	}
+	if c.in.carry == nil {
+		c.in.carry = append(poolGet(len(seg))[:0], seg...)
+	} else if cap(c.in.carry) >= len(c.in.carry)+len(seg) {
+		c.in.carry = append(c.in.carry, seg...)
+	} else {
+		grow := max(2*cap(c.in.carry), len(c.in.carry)+len(seg))
+		nb := append(poolGet(grow)[:0], c.in.carry...)
+		nb = append(nb, seg...)
+		poolPut(c.in.carry)
+		c.in.carry = nb
+	}
+	c.in.syncPending(l.stats)
+	if len(c.in.carry)+c.in.got > l.cfg.maxPending {
+		l.closeLocal(c, ErrPendingOverflow)
+	}
+}
+
 // stashCarry 把「已从内核读出、尚未投递」的字节存进 carry。
 // bounded = true 时施加 MaxPending 封顶——暂停与投递预算截断都属于这一类
 // （两者都可能让 carry 无限增长，而 06 对 MaxPending 的定义正是这一块）。
@@ -654,8 +705,10 @@ func (l *loop) processCarry(c *connCore) {
 	defer func() {
 		if r := recover(); r != nil {
 			l.closeLocal(c, fmt.Errorf("%w: %v", ErrHandlerPanic, r))
+			l.cancelAsync(c) // 连接要关：不启动已注册的任务（01 D18）
+			return
 		}
-		l.launchAsync(c) // panic 出口：已注册的 AsyncDo 仍要启动
+		l.launchAsync(c) // 正常出口的兜底（gateSink 已处理逐条的情形）
 	}()
 	c.out.beginInLoop()
 	defer l.flushBatchEnd(c)
@@ -771,6 +824,7 @@ func (l *loop) detach(c *connCore) {
 	// 不走 token——gen 已在上面递增）。
 	if c.asyncBusy {
 		c.pendingClose = true
+		l.pendingCloses++
 		return
 	}
 	l.finishClose(c)
@@ -782,6 +836,10 @@ func (l *loop) finishClose(c *connCore) {
 		return
 	}
 	c.state = stateClosed
+	if c.pendingClose {
+		c.pendingClose = false
+		l.pendingCloses--
+	}
 	defer c.finalize()
 	if !c.opened || c.cb.onClose == nil {
 		return

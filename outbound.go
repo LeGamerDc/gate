@@ -334,11 +334,20 @@ func (o *outbound) sendFunc(n int, fill func([]byte) (int, error)) error {
 		poolPut(buf)
 		return ErrMessageTooLarge
 	}
+	// MaxBuffer 也要按新 charge 重查：旧 cipher 下贴着上限的预留，换成
+	// Overhead 更大的 cipher 之后就越限了。
 	charge := o.charge(k, o.tailCipher)
+	if o.cfg.maxBuffer >= 0 && o.reservedWire-reserved+charge > o.cfg.maxBuffer {
+		o.refundLocked(reserved)
+		o.mu.Unlock()
+		poolPut(buf)
+		o.env.stats.sendQueueFull.Add(1)
+		return ErrSendQueueFull
+	}
 	if delta := charge - reserved; delta > 0 {
 		o.reservedWire += delta
 		o.env.stats.outboundQueued.Add(int64(delta))
-		o.env.quota.acquire(delta) // 已过准入的消息不再拒绝，但账要平
+		o.env.quota.borrow(delta) // 已过准入的消息不再拒绝，但账要对称
 		o.syncWaterLocked()
 	} else {
 		o.refundLocked(-delta)
@@ -378,9 +387,12 @@ func (o *outbound) sendRaw(b []byte, force bool) error {
 		return ErrConnClosed
 	}
 	if force {
-		o.reservedWire += len(b) // 收尾帧豁免准入，但仍要计入账面
+		// 收尾帧豁免准入，但账要平：borrow 是不可拒绝的扣减，
+		// 与后续的 release 严格对称（acquire 的返回值被忽略时，
+		// release 会凭空造出额度）。
+		o.reservedWire += len(b)
 		o.env.stats.outboundQueued.Add(int64(len(b)))
-		o.env.quota.acquire(len(b))
+		o.env.quota.borrow(len(b))
 	} else if !o.admitLocked(len(b)) {
 		o.mu.Unlock()
 		o.env.stats.sendQueueFull.Add(1)

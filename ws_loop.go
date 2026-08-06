@@ -28,13 +28,25 @@ func wsOnDrain(c *connCore) func(error) {
 		if w == nil || w.closeSent {
 			return
 		}
-		code, ok := wsCloseCodeFor(reason)
-		if !ok {
-			return // 背压/写失败/对端已断：直接关 TCP
+		var frame []byte
+		switch {
+		case w.closeRecv:
+			// 回帧完成对端发起的关闭握手（RFC 6455 §5.5.1 要求回一个）。
+			if w.replyCode == 0 {
+				frame = wsControlFrame(wsOpClose, nil)
+			} else {
+				frame = wsCloseFrame(w.replyCode, "")
+			}
+		default:
+			code, ok := wsCloseCodeFor(reason)
+			if !ok {
+				return // 背压/写失败/对端已断：直接关 TCP
+			}
+			frame = wsCloseFrame(code, "")
 		}
 		// force：此刻 closing 已由 beginClose 置位，业务数据再也进不来，
 		// 所以这一帧结构上必然是 FIFO 的最后一段（W13）。
-		if c.out.sendRaw(wsCloseFrame(code, ""), true) == nil {
+		if c.out.sendRaw(frame, true) == nil {
 			w.closeSent = true
 		}
 	}
@@ -104,6 +116,18 @@ func (l *loop) wsGateFeed(c *connCore, seg []byte) error {
 		return errWSStop
 	}
 
+	// 本轮投递预算已耗尽（或读闸已降）：把 seg **追加**到 carry 就返回，
+	// 不再尝试解析。这一步是 O(1) 摊还的——旧实现每段 emit 都要把
+	// 「整个 carry + seg」重新合并一遍再发现预算已尽，攻击者用大量 1 字节
+	// WS 分片就能把它放大成 O(n²) 的内存复制（内存有 MaxPending 封顶，
+	// CPU 没有）。carry 的续投交给下一轮的 processCarry。
+	if c.pauseDepth > 0 || c.delivered >= deliverBudget {
+		l.appendCarry(c, seg)
+		l.queueCarry(c)
+		l.truncated = true
+		return nil
+	}
+
 	data := seg
 	var merged []byte
 	if c.in.carry != nil {
@@ -151,18 +175,14 @@ func (l *loop) wsCtrl(c *connCore, op byte, payload []byte) error {
 			return err // 协议违规：非法 code / 非 UTF-8 reason 留在错误路径上
 		}
 		w.closeRecv = true
-		if !w.closeSent {
-			// 回 close 完成握手。1005 表示对端没带 code，回帧也不带。
-			var frame []byte
-			if code == 1005 {
-				frame = wsControlFrame(wsOpClose, nil)
-			} else {
-				frame = wsCloseFrame(code, "")
-			}
-			if c.out.sendRaw(frame, false) == nil {
-				w.closeSent = true
-			}
+		w.replyCode = code
+		if code == 1005 {
+			w.replyCode = 0 // 对端没带码，回帧也不带
 		}
+		// **先关闭再回帧**：closeLocal 在 outbound 锁内置 closing，之后并发的
+		// Send 一律失败，回帧才可能是 FIFO 的最后一段。反过来（先入队回帧、
+		// 再关闭）中间的 Send 会排到 close 帧后面，违反 W13。
+		// 回帧本身由 onDrain 钩子用 force 路径追加。
 		// 正常关闭翻译成 ErrPeerClosed——不是错误，不该刷 warn 日志（05）。
 		l.closeLocal(c, ErrPeerClosed)
 		return errWSStop

@@ -2,13 +2,16 @@ package gate
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// AsyncDo 注册之后回调走 error / panic 出口：goroutine 仍必须启动，
-// 否则 resume 永远不来，连接卡在 pendingClose 上，OnClose 永不触发。
-func TestSerial_AsyncDoLaunchesOnErrorExit(t *testing.T) {
+// AsyncDo 注册之后回调走 error / panic 出口：按 01 D18 **不启动** f
+// （「连接要关时干脆不启动，省掉一次注定没用的 RPC」），但必须把注册
+// 撤销干净——注册了却既不启动也不取消的话，没有任何东西会送出 resume，
+// 连接进 Detached 后永远挂在 pendingClose 上，OnClose 永不触发。
+func TestSerial_AsyncDoCancelledOnErrorExit(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		exit func() error
@@ -18,9 +21,9 @@ func TestSerial_AsyncDoLaunchesOnErrorExit(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
-			ran := make(chan struct{})
+			var ran atomic.Bool
 			h.onMsg = func([]byte) error {
-				if err := h.c.asyncDo(func() { close(ran) }); err != nil {
+				if err := h.c.asyncDo(func() { ran.Store(true) }); err != nil {
 					t.Fatal(err)
 				}
 				return tc.exit()
@@ -28,18 +31,42 @@ func TestSerial_AsyncDoLaunchesOnErrorExit(t *testing.T) {
 			h.feedFrames([]byte("go"))
 			h.readable()
 
-			select {
-			case <-ran:
-			case <-time.After(3 * time.Second):
-				t.Fatal("AsyncDo 的 goroutine 从未启动（任务永久悬空）")
-			}
+			// 连接必须能一路走完关闭，不卡在 pendingClose 上。
 			waitFor(t, func() bool {
+				h.advance(2 * time.Second)
 				h.l.step()
 				return h.closed == 1
 			})
+			if ran.Load() {
+				t.Fatal("连接要关时不该启动 AsyncDo 的 f（01 D18）")
+			}
+			if h.c.asyncBusy || h.c.asyncFn != nil {
+				t.Fatal("注册未撤销干净")
+			}
 			h.verifyConservation()
 		})
 	}
+}
+
+// AsyncDo(nil)：不占用 asyncBusy，否则没人会送出它的 resume。
+func TestSerial_AsyncDoNilIsNoop(t *testing.T) {
+	h := newHarness(t)
+	h.onMsg = func([]byte) error { return h.c.asyncDo(nil) }
+	h.feedFrames([]byte("go"))
+	h.readable()
+	if h.c.asyncBusy || h.c.pauseDepth != 0 {
+		t.Fatalf("AsyncDo(nil) 不该占用串行域: busy=%v depth=%d", h.c.asyncBusy, h.c.pauseDepth)
+	}
+	// 后续消息照常投递。
+	h.feedFrames([]byte("next"))
+	h.onMsg = nil
+	h.readable()
+	if len(h.msgs) != 1 {
+		t.Fatalf("msgs=%d", len(h.msgs))
+	}
+	h.c.requestClose(nil)
+	h.l.step()
+	h.verifyConservation()
 }
 
 // OnOpen 里 Pause：tnode 已在 pause 链上，openConn 不得再把它挂进 idle 链

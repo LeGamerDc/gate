@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -53,16 +54,17 @@ func TestServer_HandshakeCounterNeverGoesNegative(t *testing.T) {
 	}
 }
 
-// Shutdown 必须等到每条连接都走完 OnClose——而不是等 fd 数归零。
-// 在途 AsyncDo 会让「拆 socket」早于「OnClose」，按 fd 收尾会丢掉它们。
-func TestServer_ShutdownWaitsForOnCloseWithAsyncInFlight(t *testing.T) {
+// 01 明写：Shutdown **不等待**在途 AsyncDo——这些连接的 socket 会被正常
+// 拆除（fd、缓冲、槽位都回收），但 OnClose 要等各自的 f 结束后才触发，
+// 进程先退出就不触发了。等 OnClose 会让一个不返回的业务任务把 Shutdown
+// 拖到 ctx 到期，那正是这条规格要避免的。
+func TestServer_ShutdownDoesNotWaitForAsync(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{})
-	var closed sync.WaitGroup
-	closed.Add(1)
-	var closeReason error
+	var closed atomic.Int32
+	var closeReason atomic.Value
 
-	opts := Options[string]{
+	srv, err := Listen(Options[string]{
 		Addr:  "127.0.0.1:0",
 		Loops: 1,
 		Handler: funcHandler[string]{
@@ -73,12 +75,11 @@ func TestServer_ShutdownWaitsForOnCloseWithAsyncInFlight(t *testing.T) {
 				})
 			},
 			clsd: func(c *Conn[string], reason error) {
-				closeReason = reason
-				closed.Done()
+				closeReason.Store(reason)
+				closed.Add(1)
 			},
 		},
-	}
-	srv, err := Listen(opts)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,31 +87,29 @@ func TestServer_ShutdownWaitsForOnCloseWithAsyncInFlight(t *testing.T) {
 	cl.sendMsgs([]byte("go"))
 	<-started
 
+	// 任务还卡着，但 socket 的拆除不依赖它：Shutdown 必须及时返回。
 	done := make(chan error, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		done <- srv.Shutdown(ctx)
 	}()
-
-	select {
-	case <-done:
-		t.Fatal("在途 AsyncDo 未结束，Shutdown 就返回了（OnClose 会被丢掉）")
-	case <-time.After(150 * time.Millisecond):
-	}
-	close(release)
-
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Shutdown 未在任务结束后返回")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown 被在途 AsyncDo 拖住了（01 明写不等待）")
 	}
-	closed.Wait()
-	if !errors.Is(closeReason, ErrServerClosed) {
-		t.Fatalf("reason=%v", closeReason)
+	if closed.Load() != 0 {
+		t.Fatal("任务未结束，OnClose 不该已触发")
+	}
+	close(release)
+	// 进程仍在，f 结束后 OnClose 才补上——「进程先退出就不触发」的另一半。
+	waitCond(t, func() bool { return closed.Load() == 1 })
+	if r, _ := closeReason.Load().(error); !errors.Is(r, ErrServerClosed) {
+		t.Fatalf("reason=%v", r)
 	}
 }
 
@@ -142,8 +141,8 @@ func TestServer_NoConnSurvivesShutdown(t *testing.T) {
 		}
 		cancel()
 		wg.Wait()
-		if got := srv.live.Load(); got != 0 {
-			t.Fatalf("Shutdown 之后仍有 %d 条连接未收尾", got)
+		if got := srv.conns.Load(); got != 0 {
+			t.Fatalf("Shutdown 之后仍有 %d 条连接的 socket 未拆除", got)
 		}
 	}
 }

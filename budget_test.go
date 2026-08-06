@@ -113,6 +113,49 @@ func TestQuota_ServerBudgetRejectsBeyondGlobalLimit(t *testing.T) {
 	}
 }
 
+// 租约不得永久沉淀：8 个 loop 各借还一次之后，全局预算必须完好——
+// 此刻真实积压是 0，却因为每个 loop 扣住一段而再也租不出东西，
+// 那不是「允许的近似超额」，是无积压时的假性耗尽。
+func TestQuota_NoLeaseSediment(t *testing.T) {
+	budget := newServerBudget(32 << 10)
+	var leases []*quotaLease
+	for range 8 {
+		q := newQuotaLease(budget)
+		if !q.acquire(1) {
+			t.Fatal("acquire(1) 应成功")
+		}
+		q.release(1)
+		leases = append(leases, q)
+	}
+	if got := budget.remaining.Load(); got != 32<<10 {
+		t.Fatalf("预算沉淀在租约里: remaining=%d, want %d", got, 32<<10)
+	}
+	ninth := newQuotaLease(budget)
+	if !ninth.acquire(1) {
+		t.Fatal("无积压时第九个 loop 仍应能租到")
+	}
+	_ = leases
+}
+
+// borrow 是不可拒绝的扣减，但必须与 release 对称——忽略 acquire 的失败
+// 返回值再无条件 release，会凭空造出额度，之后就能突破 MaxOutboundBytes。
+func TestQuota_BorrowIsSymmetric(t *testing.T) {
+	budget := newServerBudget(8 << 10)
+	q := newQuotaLease(budget)
+	if !q.acquire(4 << 10) {
+		t.Fatal("acquire 应成功")
+	}
+	q.borrow(1 << 20) // 远超预算：允许，但记账
+	q.release(1 << 20)
+	q.release(4 << 10)
+	if got := budget.remaining.Load() + q.avail.Load(); got != 8<<10 {
+		t.Fatalf("borrow/release 不对称: %d, want %d", got, 8<<10)
+	}
+	if got := q.outstanding.Load(); got != 0 {
+		t.Fatalf("outstanding=%d, want 0", got)
+	}
+}
+
 func TestQuota_UnlimitedNeverBlocks(t *testing.T) {
 	q := newQuotaLease(newServerBudget(0)) // Unlimited
 	for range 100 {
@@ -172,11 +215,13 @@ func TestQuota_ConservesAcrossAllRefundPaths(t *testing.T) {
 	_ = o.send(mkPayload(500), flagE)
 	o.discard() // 丢弃路径
 
-	// 配平的口径是「server 未租出的 + 本 loop 未用的 == 总量」：
-	// 租约本来就允许字节停在 loop 手里（这正是近似的来源），
-	// 但它们必须仍在账上。
+	// 配平的口径是「server 未租出的 + 本 loop 未用的 == 总量」。
+	// 全部写完/丢弃之后 outstanding 归零，租约也该整段还回去。
 	if got := budget.remaining.Load() + o.env.quota.avail.Load(); got != start {
 		t.Fatalf("配额未配平: %d, want %d（漏了 %d）", got, start, start-got)
+	}
+	if got := o.env.quota.outstanding.Load(); got != 0 {
+		t.Fatalf("outstanding=%d, want 0", got)
 	}
 }
 

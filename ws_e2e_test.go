@@ -451,3 +451,45 @@ func TestWS_HandshakeAcrossReads(t *testing.T) {
 }
 
 var _ = time.Second
+
+// 预算耗尽后继续喂入不得退化成 O(n²)：旧实现每段 emit 都把「整个 carry +
+// 新段」重新合并一遍才发现预算已尽，攻击者用大量 1 字节 WS 分片就能把它
+// 放大成数百 GB 级的内存复制（内存有 MaxPending 封顶，CPU 没有）。
+func TestWS_NoQuadraticCarryCopy(t *testing.T) {
+	h := newWSHarness(t, func(c *loopConfig) { c.maxPending = 8 << 20 })
+	h.onMsg = func([]byte) error { return nil }
+
+	// 把 carry 顶到 rbuf 之外：每轮读进来的字节多于 1024 条／轮的投递预算，
+	// 差额一轮轮堆进 carry。
+	msgs := make([][]byte, 12000)
+	for i := range msgs {
+		msgs[i] = mkPayload(200)
+	}
+	gate := gateWire(t, msgs...)
+	h.io.feed(wsClientFrame(false, wsOpBinary, gate, testMask))
+	for range 6 {
+		h.readable()
+	}
+	carried := len(h.c.in.carry)
+	if carried < 64<<10 {
+		t.Fatalf("carry=%d，没构造出足够大的残留", carried)
+	}
+
+	// 再灌 400 个 1 字节分片：旧实现每片复制一次整个 carry。
+	// 用池的未命中数当放大计（每次整段重新合并都要借一块新缓冲）。
+	before := poolMisses.Load()
+	var frag []byte
+	for range 400 {
+		frag = append(frag, wsClientFrame(false, wsOpContinuation, []byte{0x00}, testMask)...)
+	}
+	h.io.feed(frag)
+	h.readable()
+
+	// 摊还追加：400 个 1 字节分片只会引起对数级的扩容次数。
+	if got := poolMisses.Load() - before; got > 32 {
+		t.Fatalf("carry 追加引起 %d 次新分配，疑似每段重新合并（O(n²)）", got)
+	}
+	h.c.requestClose(nil)
+	h.l.step()
+	h.verifyConservation()
+}

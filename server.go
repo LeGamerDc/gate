@@ -199,7 +199,9 @@ func Run[S any](ctx context.Context, opts Options[S]) error {
 // Addr 返回实际监听地址（随机端口场景取回真实端口）。
 func (s *Server[S]) Addr() netip.AddrPort { return s.addr }
 
-// Wait 阻塞到 Shutdown 完成。
+// Wait 阻塞到 server 完全收尾：不只是 socket 拆除（那是 Shutdown 的返回点），
+// 还包括给带在途 AsyncDo 的连接补上的最后一次 OnClose。业务任务永不返回时
+// 它也不会返回——那需要业务自己的 context 收敛（01「ctx 约束的是什么」）。
 func (s *Server[S]) Wait() error {
 	<-s.done
 	return s.waitErr
@@ -270,13 +272,14 @@ func (s *Server[S]) Shutdown(ctx context.Context) error {
 		})
 		l.wk.maybeNotify()
 	}
-	// 2. 等每条连接走完 OnClose。等的是 live 而不是 conns：拆 socket
-	// （conns 的释放点）不等在途 AsyncDo，而 OnClose 要等——按 conns 收尾
-	// 会在任务还没回来时就停掉 loop，那些连接的 OnClose 永远不会触发。
+	// 2. 等每条连接的 socket 拆除完成。等的是 conns 而不是 live：
+	// 01 明写「在途的 AsyncDo 不会被等待——这些连接的 socket 会被正常拆除，
+	// 但它们的 OnClose 要等各自的 f 结束后才触发；进程先退出的话就不触发了」。
+	// 等 OnClose 会让一个不返回的业务任务把 Shutdown 拖到 ctx 到期。
 	tick := time.NewTicker(2 * time.Millisecond)
 	defer tick.Stop()
 	forced := false
-	for s.live.Load() > 0 {
+	for s.conns.Load() > 0 {
 		select {
 		case <-ctx.Done():
 			if !forced {
@@ -297,29 +300,34 @@ func (s *Server[S]) Shutdown(ctx context.Context) error {
 			}
 			// 强拆之后仍留一小段时间让 loop 真正执行它；到点就停——
 			// 业务回调可能永不返回，那时谁也救不了（01「ctx 约束的是什么」）。
-			if !s.waitFor(ctx, func() bool { return s.live.Load() == 0 }) {
+			if !s.waitFor(func() bool { return s.conns.Load() == 0 }) {
 				s.log.Warn("gate: shutdown deadline exceeded, forcing loop stop",
-					zap.Int64("conns_left", s.live.Load()))
+					zap.Int64("conns_left", s.conns.Load()))
 				goto stop
 			}
 		case <-tick.C:
 		}
 	}
 stop:
+	// 3. socket 已经全部拆除。给 loop 置停止位后**立即返回**——它们可能还
+	// 要多活一会儿，去给带在途 AsyncDo 的连接补最后一次 OnClose（01：
+	// Shutdown 不等待这些任务）。真正的收尾由 Wait 观察。
 	for _, l := range s.loops {
 		l.stop.Store(true)
 		_ = l.p.notify()
 	}
-	s.wg.Wait()
-	close(s.done)
-	return s.waitErr
+	go func() {
+		s.wg.Wait()
+		close(s.done)
+	}()
+	return nil
 }
 
 // waitFor 等条件成立，最多 forceGrace；返回条件是否真的成立
 // （旧实现不报告结果，超时后照样停 loop，残余 fd 无人回收）。
 const forceGrace = 500 * time.Millisecond
 
-func (s *Server[S]) waitFor(ctx context.Context, cond func() bool) bool {
+func (s *Server[S]) waitFor(cond func() bool) bool {
 	deadline := time.Now().Add(forceGrace)
 	for time.Now().Before(deadline) {
 		if cond() {

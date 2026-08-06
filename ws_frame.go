@@ -66,6 +66,7 @@ type wsState struct {
 
 	closeSent bool // 本地 close 帧已入出站链：之后不再排数据帧（W13）
 	closeRecv bool // 收到对端 close 帧：之后入站数据帧不再投递
+	replyCode int  // closeRecv 时要回的状态码（0 = 不带码，对应对端 1005）
 }
 
 func (w *wsState) release() {

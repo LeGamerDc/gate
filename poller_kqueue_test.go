@@ -134,23 +134,35 @@ func TestPoller_DelStopsEvents(t *testing.T) {
 
 func TestPoller_NotifyWakesBlockedWait(t *testing.T) {
 	p := newTestPoller(t)
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		for range 3 { // 幂等：连发多次只保证至少醒一次
-			_ = p.notify()
+
+	// 幂等：wait 之前连发多次只合并成一个事件（notify 的契约是
+	// 「至少醒一次」，不是「醒 N 次」）。全部放在 wait 之前，
+	// 避免「wait 已返回、后续 notify 又触发一次」的时序竞态。
+	for range 3 {
+		if err := p.notify(); err != nil {
+			t.Fatal(err)
 		}
-	}()
-	start := time.Now()
-	evs := waitOne(t, p, 5*time.Second)
-	if time.Since(start) > time.Second {
-		t.Fatal("notify 未及时唤醒 wait")
 	}
+	evs := waitOne(t, p, time.Second)
 	if len(evs) != 1 || evs[0].tok.kind() != tokNotify {
 		t.Fatalf("evs=%+v", evs)
 	}
-	// EV_CLEAR：送达即复位，无重复事件。
+	// EV_CLEAR：送达即复位。
 	if evs := waitOne(t, p, 20*time.Millisecond); len(evs) != 0 {
 		t.Fatalf("notify 事件未复位: %+v", evs)
+	}
+
+	// 跨 goroutine 唤醒一个真正阻塞中的 wait。
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_ = p.notify()
+	}()
+	start := time.Now()
+	if evs := waitOne(t, p, 5*time.Second); len(evs) != 1 {
+		t.Fatalf("evs=%+v", evs)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("notify 未及时唤醒 wait: %v", d)
 	}
 }
 

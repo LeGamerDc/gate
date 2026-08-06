@@ -53,9 +53,14 @@ func (b *serverBudget) give(n int64) { b.remaining.Add(n) }
 
 // quotaLease 是单个 loop 持有的租约。acquire/release 可能来自任意 goroutine
 // （Send 不限线程），所以是原子的。
+//
+// outstanding 记「当前真正被账面占着的字节」：它归零时把整段租约还回 server。
+// 没有这一步，小预算下每个 loop 都会永久扣住一段——8 个 loop 各发一个字节
+// 再全部写完，server 侧就再也租不出任何东西了，而此刻真实积压是 0。
 type quotaLease struct {
-	srv   *serverBudget
-	avail atomic.Int64
+	srv         *serverBudget
+	avail       atomic.Int64
+	outstanding atomic.Int64
 }
 
 func newQuotaLease(srv *serverBudget) *quotaLease { return &quotaLease{srv: srv} }
@@ -70,6 +75,7 @@ func (q *quotaLease) acquire(n int) bool {
 		cur := q.avail.Load()
 		if cur >= int64(n) {
 			if q.avail.CompareAndSwap(cur, cur-int64(n)) {
+				q.outstanding.Add(int64(n))
 				return true
 			}
 			continue
@@ -89,14 +95,34 @@ func (q *quotaLease) acquire(n int) bool {
 	}
 }
 
-// release 归还 n 字节；富余越过两倍粒度时把多出来的还回 server，
-// 免得字节永久沉淀在一个不再活跃的 loop 上（那会让别的 loop 饿死）。
+// borrow 是**不可拒绝**的扣减：收尾帧（close）与 SendFunc commit 时因
+// cipher epoch 变化产生的差额都已经过了准入，不能再退回去。它允许把租约
+// 压成负数——那正是 06 说的「近似」：超额有界（每 loop 至多一个收尾帧 +
+// 一个 Overhead 差额），而账面必须与 release 对称，否则 release 会凭空
+// 造出额度，之后就能突破 MaxOutboundBytes。
+func (q *quotaLease) borrow(n int) {
+	if q == nil || q.srv.unlimited() || n == 0 {
+		return
+	}
+	q.avail.Add(int64(-n))
+	q.outstanding.Add(int64(n))
+}
+
+// release 归还 n 字节。占用归零时把整段租约还回 server；否则只在富余越过
+// 两倍粒度时还一部分——前者防沉淀，后者摊薄对 server 计数器的争用。
 func (q *quotaLease) release(n int) {
 	if q == nil || q.srv.unlimited() || n == 0 {
 		return
 	}
-	chunk := q.srv.chunk
 	cur := q.avail.Add(int64(n))
+	if q.outstanding.Add(int64(-n)) <= 0 {
+		// 本 loop 已经没有在途占用：整段还回去，别让它饿死别的 loop。
+		if cur > 0 && q.avail.CompareAndSwap(cur, 0) {
+			q.srv.give(cur)
+		}
+		return
+	}
+	chunk := q.srv.chunk
 	for cur > 2*chunk {
 		back := cur - chunk
 		if q.avail.CompareAndSwap(cur, cur-back) {

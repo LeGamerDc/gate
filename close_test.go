@@ -11,15 +11,22 @@ import (
 func newShellHarness(t *testing.T, h Handler[string]) (*harness, *Conn[string]) {
 	t.Helper()
 	hh := newHarnessNoOpen(t)
-	shell := bindConn(h, hh.c, 1, netip.MustParseAddrPort("127.0.0.1:1"), nil)
-	base := hh.c.cb.onClose
-	hh.c.cb.onClose = func(reason error) {
-		hh.closed++
-		hh.closeReason = reason
-		base(reason)
-	}
+	shell := bindShell(hh, h, nil)
 	hh.l.openConn(hh.c)
 	return hh, shell
+}
+
+// bindShell 把泛型壳绑上已有的 harness 连接，并保留 harness 对 OnClose 的记录
+// （bindConn 会整体覆写回调，直接用它会让 h.closed / h.closeReason 永远不动）。
+func bindShell(h *harness, handler Handler[string], hs *Handshake) *Conn[string] {
+	shell := bindConn(handler, h.c, 1, netip.MustParseAddrPort("127.0.0.1:1"), hs)
+	base := h.c.cb.onClose
+	h.c.cb.onClose = func(reason error) {
+		h.closed++
+		h.closeReason = reason
+		base(reason)
+	}
+	return shell
 }
 
 // 01 D15 的硬保证：Close 返回之后 Send 一定报错。
@@ -117,8 +124,7 @@ func TestClose_ConcurrentArbitration(t *testing.T) {
 func TestW13_NoDataFrameAfterCloseFrame(t *testing.T) {
 	for range 100 {
 		h := newWSHarness(t)
-		shell := bindConn(funcHandler[string]{}, h.c, 1,
-			netip.MustParseAddrPort("127.0.0.1:1"), &Handshake{})
+		shell := bindShell(h, funcHandler[string]{}, &Handshake{})
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
@@ -140,6 +146,60 @@ func TestW13_NoDataFrameAfterCloseFrame(t *testing.T) {
 			}
 		}
 	}
+}
+
+// 对端发起的关闭同样不能被数据帧越过：旧实现先普通入队回帧、再 closeLocal，
+// 两者之间并发的 Send 会排到 close 帧后面（W13）。
+func TestW13_PeerCloseNotOvertakenByData(t *testing.T) {
+	for range 100 {
+		h := newWSHarness(t)
+		shell := bindShell(h, funcHandler[string]{}, &Handshake{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 20 {
+				if shell.Send([]byte("racing")) != nil {
+					return
+				}
+			}
+		}()
+		// 对端 close（1000）与并发 Send 撞在一起。
+		h.io.feed(wsClientFrame(true, wsOpClose, []byte{0x03, 0xE8}, testMask))
+		h.readable()
+		wg.Wait()
+		h.l.step()
+
+		frames := decodeServerWS(t, h.io.wrote.Bytes())
+		sawClose := false
+		for _, f := range frames {
+			if sawClose && f.op != wsOpClose {
+				t.Fatal("对端关闭的回帧之后还有数据帧（W13）")
+			}
+			if f.op == wsOpClose {
+				sawClose = true
+			}
+		}
+		if !sawClose {
+			t.Fatal("对端 close 未回帧（RFC 6455 §5.5.1 要求回一个）")
+		}
+		if !errors.Is(h.closeReason, ErrPeerClosed) {
+			t.Fatalf("reason=%v", h.closeReason)
+		}
+	}
+}
+
+// 对端不带状态码（1005）时，回帧也不带。
+func TestW13_PeerCloseWithoutCodeEchoesEmpty(t *testing.T) {
+	h := newWSHarness(t)
+	h.io.feed(wsClientFrame(true, wsOpClose, nil, testMask))
+	h.readable()
+	h.l.step()
+	frames := decodeServerWS(t, h.io.wrote.Bytes())
+	if len(frames) != 1 || frames[0].op != wsOpClose || len(frames[0].payload) != 0 {
+		t.Fatalf("frames=%v", frames)
+	}
+	h.verifyConservation()
 }
 
 // 写失败之后不发 close 帧、不再尝试任何写（05 最后一行 + O8）。

@@ -215,7 +215,6 @@ func (l *loop) resumeOnLoop(c *connCore) {
 		// 拆除之后才到达的 resume（典型是在途 AsyncDo 结束）：
 		// 资源都已归还，它唯一还要做的事就是解锁 pendingClose。
 		if c.pendingClose && !c.asyncBusy {
-			c.pendingClose = false
 			l.finishClose(c)
 		}
 		return
@@ -232,8 +231,7 @@ func (l *loop) resumeOnLoop(c *connCore) {
 	}
 
 	if c.pendingClose {
-		c.pendingClose = false
-		l.finishClose(c)
+		l.finishClose(c) // finishClose 自己清 pendingClose 并结账
 		return
 	}
 	// 上面的闭包可能重新 Pause（或关掉连接）：只有仍然 Open 且读闸已开
@@ -310,6 +308,9 @@ func (c *connCore) asyncDo(fn func()) error {
 	if c.asyncBusy {
 		return ErrAsyncBusy
 	}
+	if fn == nil {
+		return nil // 空任务：不占用 asyncBusy，也就不会有人等它的 resume
+	}
 	c.asyncBusy = true
 	resume := c.pause()
 	c.asyncFn = fn
@@ -317,12 +318,13 @@ func (c *connCore) asyncDo(fn func()) error {
 	return nil
 }
 
-// launchAsync 在回调返回点由 loop 调用：真正起 goroutine。
+// launchAsync 在回调**成功返回**的那一点由 loop 调用：真正起 goroutine。
+// 幂等（asyncFn 一取即清），多个出口都调只有第一个生效。
 //
-// **必须在回调的所有出口都调用**，包括回调返回 error 和 panic 的出口：
-// 任务已经注册（asyncBusy = true、读闸已降），goroutine 却没起来的话，
-// 没有任何东西会送出 resume——连接进 Detached 后挂在 pendingClose 上，
-// OnClose 永远不触发，core 与 State 永久留在 loop 的收件箱里。
+// 与它配对的是 cancelAsync：回调以 error / panic 退出时不启动 f
+// （01 D18：「连接要关时干脆不启动 f，省掉一次注定没用的 RPC」）。
+// 两者必须覆盖回调的**每一个**出口——注册了任务却既不启动也不取消的话，
+// 没有任何东西会送出 resume，连接进 Detached 后永远挂在 pendingClose 上。
 func (l *loop) launchAsync(c *connCore) {
 	fn, resume := c.asyncFn, c.asyncResume
 	if fn == nil {
@@ -344,17 +346,34 @@ func (l *loop) launchAsync(c *connCore) {
 	}()
 }
 
+// cancelAsync 撤销一次已注册但不该启动的 AsyncDo：清掉暂存、放开读闸、
+// 清 asyncBusy。只在 loop 线程调用（此刻 goroutine 还没起来，没有竞争）。
+func (l *loop) cancelAsync(c *connCore) {
+	if c.asyncFn == nil {
+		return
+	}
+	c.asyncFn, c.asyncResume = nil, nil
+	c.asyncBusy = false
+	l.resumeOnLoop(c) // 撤销 asyncDo 里那次 pause
+}
+
 // runSafe 在恢复屏障内执行串行域闭包；panic ⇒ 关连接（ErrHandlerPanic）。
-// AsyncDo 的 goroutine 在**当次回调返回之后**启动——放在 defer 里，
-// 保证 panic 出口也会启动（否则任务会永久悬空，见 launchAsync 的注释）。
+// AsyncDo 的 goroutine 在**当次回调成功返回之后**启动；panic 出口按 01 D18
+// 取消注册而不是启动。
 func (l *loop) runSafe(c *connCore, fn func()) {
+	panicked := true
 	defer func() {
 		if r := recover(); r != nil {
 			l.closeLocal(c, fmt.Errorf("%w: %v", ErrHandlerPanic, r))
 		}
-		l.launchAsync(c)
+		if panicked {
+			l.cancelAsync(c)
+		} else {
+			l.launchAsync(c)
+		}
 	}()
 	fn()
+	panicked = false
 }
 
 // currentInterest 按状态与子状态推导应有的兴趣集合。
