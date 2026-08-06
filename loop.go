@@ -3,6 +3,7 @@ package gate
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -104,24 +105,53 @@ type loop struct {
 
 	backoffUntil int64 // EMFILE 退避（accept 层使用）
 
-	// onAccept 处理 listener 事件（M6 装配）；onHsRead 处理 Proxy/Handshaking
-	// 的读事件（M5/M6 装配）。M4 的纯 TCP 路径不经过它们。
+	// onAccept 处理 listener 事件（server 装配）；onHsRead 处理
+	// Proxy/Handshaking 的读事件。测试 harness 不经过它们。
 	onAccept func(lfd int)
 	onHsRead func(c *connCore)
+
+	// server 装配注入的运行时（测试下为零值/nil）。
+	loopID       int
+	idSeq        uint64 // Conn.ID = loopID<<48 | idSeq++（永不复用，R6）
+	stats        *loopStats
+	onConnClosed func(*connCore) // detach 时回调（server 的全局计数）
+	listener     int             // 本 loop 持有的 listener fd；-1 = 无
+	reserveFd    int             // EMFILE 预留 fd（R11）；-1 = 未启用
+	backoffCur   int64           // EMFILE 指数退避当前值（纳秒）
+	stop         atomic.Bool     // Shutdown 置位
 
 	nconns int
 }
 
+// run 驱动循环直到 stop 置位。退出前关闭 poller。
+func (l *loop) run() {
+	for !l.stop.Load() {
+		l.step()
+	}
+	if l.reserveFd >= 0 {
+		_ = unixClose(l.reserveFd)
+	}
+	_ = l.p.close()
+}
+
+func (l *loop) nextConnID() uint64 {
+	l.idSeq++
+	return uint64(l.loopID)<<48 | l.idSeq
+}
+
 func newLoop(p poller, io connIO, now func() int64, cfg loopConfig, enc encoderOptions) *loop {
 	l := &loop{
-		p:      p,
-		io:     io,
-		now:    now,
-		env:    newLoopEnv(enc),
-		cfg:    cfg,
-		rbuf:   make([]byte, rbufSize),
-		events: make([]event, maxLoopEvents),
+		p:         p,
+		io:        io,
+		now:       now,
+		env:       newLoopEnv(enc),
+		cfg:       cfg,
+		rbuf:      make([]byte, rbufSize),
+		events:    make([]event, maxLoopEvents),
+		listener:  -1,
+		reserveFd: -1,
 	}
+	l.stats = l.env.stats
 	l.wk.p = p
 	l.idleLRU.init()
 	l.hsLRU.init()
@@ -207,6 +237,7 @@ func (l *loop) openConn(c *connCore) {
 		return
 	}
 	c.opened = true
+	l.stats.connsOpen.Add(1)
 	l.idleLRU.pushBack(&c.tnode, l.now())
 	// OnOpen 里可能 Send 了 welcome（inLoop 之外的直接调用会自行 arm）；
 	// 也可能调了 AsyncDo——回调返回点在这里。
@@ -279,6 +310,14 @@ func (l *loop) step() {
 		c := o.owner
 		st := o.flush(true, false)
 		l.applyWriteStatus(c, st)
+	}
+
+	// 阶段 2.5：EMFILE 退避到期，恢复 listener 的读兴趣（R11）。
+	if l.backoffUntil != 0 && l.now() >= l.backoffUntil {
+		l.backoffUntil = 0
+		if l.listener >= 0 {
+			_ = l.p.mod(l.listener, makeToken(tokListener, 0, uint32(l.listener)), interestRead)
+		}
 	}
 
 	// 阶段 3：超时扫描（expire 自带「到点才做」判断）。
@@ -422,6 +461,7 @@ func (l *loop) connReadable(c *connCore) {
 			}
 			calls++
 			bytes += n
+			l.stats.bytesIn.Add(uint64(n))
 			c.in.got += n
 			if c.in.got == len(c.in.body) {
 				body := c.in.body
@@ -438,6 +478,7 @@ func (l *loop) connReadable(c *connCore) {
 		}
 		calls++
 		bytes += n
+		l.stats.bytesIn.Add(uint64(n))
 		if carryLen > 0 {
 			copy(l.rbuf, c.in.carry)
 			poolPut(c.in.carry)
@@ -519,6 +560,7 @@ type handlerErr struct{ error }
 
 func (l *loop) deliverFrame(c *connCore, f frame) {
 	err := c.cdc.deliver(f, c.ciph, nil, func(msg []byte, _ bool) error {
+		l.stats.messagesIn.Add(1)
 		if cbErr := c.cb.onMessage(msg); cbErr != nil {
 			return handlerErr{cbErr}
 		}
@@ -667,6 +709,17 @@ func (l *loop) detach(c *connCore) {
 	s.gen = (s.gen + 1) & genMask
 	l.free = append(l.free, c.slotIdx)
 	l.nconns--
+	// 统计与 server 级计数。
+	l.stats.countClose(c.closeReason())
+	if c.opened {
+		l.stats.connsOpen.Add(-1)
+	}
+	if c.pauseDepth > 0 {
+		l.stats.connsPaused.Add(-1)
+	}
+	if l.onConnClosed != nil {
+		l.onConnClosed(c)
+	}
 	// 6. 串行域未空闲（在途 AsyncDo）⇒ 等 resume 控制项（直携 core 引用，
 	// 不走 token——gen 已在上面递增）。
 	if c.asyncBusy {

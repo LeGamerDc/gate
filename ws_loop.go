@@ -49,6 +49,7 @@ func (l *loop) wsReadable(c *connCore) {
 		}
 		calls++
 		bytes += n
+		l.stats.bytesIn.Add(uint64(n))
 		if !l.wsFeed(c, l.rbuf[:n]) {
 			return
 		}

@@ -125,23 +125,26 @@ func (l *loop) wsHsReadable(c *connCore, opts *WebSocketOptions, done func(hs *H
 	if maxHS <= 0 {
 		maxHS = defaultMaxHandshakeBytes
 	}
-	for calls := 0; calls < readBudgetCalls; calls++ {
-		n, err := l.io.read(c.fd, l.rbuf)
-		if !l.readOK(c, n, err) {
-			return
-		}
-		// 累积进 carry（握手不是热路径，池间搬运可接受）。
-		if c.in.carry == nil {
-			c.in.carry = append(poolGet(n)[:0], l.rbuf[:n]...)
-		} else {
-			need := len(c.in.carry) + n
-			if cap(c.in.carry) >= need {
-				c.in.carry = append(c.in.carry, l.rbuf[:n]...)
+	for range readBudgetCalls {
+		// PROXY 阶段的剩余字节可能已含完整升级请求：先试 carry 再读。
+		if !bytes.Contains(c.in.carry, crlfcrlf) {
+			n, err := l.io.read(c.fd, l.rbuf)
+			if !l.readOK(c, n, err) {
+				return
+			}
+			// 累积进 carry（握手不是热路径，池间搬运可接受）。
+			if c.in.carry == nil {
+				c.in.carry = append(poolGet(n)[:0], l.rbuf[:n]...)
 			} else {
-				nb := append(poolGet(need)[:0], c.in.carry...)
-				nb = append(nb, l.rbuf[:n]...)
-				poolPut(c.in.carry)
-				c.in.carry = nb
+				need := len(c.in.carry) + n
+				if cap(c.in.carry) >= need {
+					c.in.carry = append(c.in.carry, l.rbuf[:n]...)
+				} else {
+					nb := append(poolGet(need)[:0], c.in.carry...)
+					nb = append(nb, l.rbuf[:n]...)
+					poolPut(c.in.carry)
+					c.in.carry = nb
+				}
 			}
 		}
 		data := c.in.carry

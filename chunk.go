@@ -67,8 +67,9 @@ func (s *chunkSlab) put(c *chunk) {
 // loopEnv 是每事件循环一套的编码暂存：iovec、chunk slab、懒初始化的 zstd 编码器。
 // 跨调用的暂存空间一律按事件循环池化，不挂成连接级字段（01「内存与 GC 预算」）。
 type loopEnv struct {
-	iov  [][]byte
-	slab chunkSlab
+	iov   [][]byte
+	slab  chunkSlab
+	stats *loopStats // 与 loop.stats 同一对象；outbound 经它计数
 
 	enc     *zstd.Encoder
 	encInit bool
@@ -81,7 +82,7 @@ type encoderOptions struct {
 }
 
 func newLoopEnv(opts encoderOptions) *loopEnv {
-	return &loopEnv{iov: make([][]byte, 0, iovMax), encOpts: opts}
+	return &loopEnv{iov: make([][]byte, 0, iovMax), encOpts: opts, stats: &loopStats{}}
 }
 
 func zstdLevel(l CompressLevel) zstd.EncoderLevel {

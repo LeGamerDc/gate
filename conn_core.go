@@ -66,6 +66,10 @@ type connCore struct {
 	in   inboundState
 	ws   *wsState // 非 nil ⇒ WebSocket 传输：读事件先过 WS 帧层
 
+	// hsCtx 是握手期（Accepted/Proxy/Handshaking）的装配层临时状态，
+	// 进入 Open 时清空；非 nil 也意味着「还没成为业务可见的连接」。
+	hsCtx any
+
 	// 读闸 / 异步（串行域）
 	pauseDepth   int
 	pendingPosts []func() // 暂停期间排队的 Post 闭包
@@ -148,6 +152,7 @@ func (c *connCore) pause() (resume func()) {
 		l.modInterest(c, c.currentInterest()&^interestRead)
 		l.idleLRU.remove(&c.tnode)
 		l.pauseLRU.pushBack(&c.tnode, l.now())
+		l.stats.connsPaused.Add(1)
 	}
 	var once sync.Once
 	return func() {
@@ -168,6 +173,7 @@ func (l *loop) resumeOnLoop(c *connCore) {
 		return
 	}
 	l.pauseLRU.remove(&c.tnode)
+	l.stats.connsPaused.Add(-1)
 
 	// 串行域按序恢复：先放出暂停期间排队的 Post 闭包（仅 Open；Draining 起丢弃）。
 	posts := c.pendingPosts

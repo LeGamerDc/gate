@@ -76,6 +76,7 @@ func normalizeOutConfig(ob Outbound, li Limits, ws bool) outConfig {
 	}
 	if ws {
 		cfg.wireSlack = wireSlackWS
+		cfg.wsWrap = wsBinaryWrap // 编码期封帧（O12/W7）
 	}
 	switch {
 	case cfg.maxBuffer == 0:
@@ -180,6 +181,7 @@ func (o *outbound) send(b []byte, permit byte) error {
 	charge := o.charge(len(b), o.tailCipher)
 	if o.cfg.maxBuffer >= 0 && o.reservedWire+charge > o.cfg.maxBuffer {
 		o.mu.Unlock()
+		o.env.stats.sendQueueFull.Add(1)
 		return ErrSendQueueFull // 消息从未入队，帧流没有洞（O1）
 	}
 	// 复制保持在锁内：挪到锁外会打开「检查与入队之间被 Close/SetCipher 改写前提」
@@ -188,6 +190,8 @@ func (o *outbound) send(b []byte, permit byte) error {
 	copy(data, b)
 	wake := o.enqueueLocked(stage1Item{kind: itemMessage, data: data, maskPermit: permit}, charge)
 	o.mu.Unlock()
+	o.env.stats.messagesOut.Add(1)
+	o.env.stats.bytesOutRaw.Add(uint64(len(b)))
 	if wake {
 		o.loop.maybeNotify()
 	}
@@ -503,6 +507,7 @@ func (o *outbound) encodeItems(items []stage1Item) (err error) {
 
 		case itemFrame:
 			charged += len(it.frame.wire) + o.cfg.wireSlack
+			o.env.stats.framesOut.Add(1)
 			c := o.env.slab.get()
 			c.kind, c.buf, c.n, c.frame = chunkFrame, it.frame.wire, int32(len(it.frame.wire)), it.frame
 			appendChunk(c)
@@ -613,6 +618,7 @@ func (o *outbound) encoderIf(need bool) *zstd.Encoder {
 // pushFrameChunks 把 builtFrame 落成 inline(帧头) + pooled(body) 两个 chunk。
 // 帧头内联在 chunk 节点里——它是持久线路字节，必须活到该 chunk 完全写出（O12）。
 func (o *outbound) pushFrameChunks(bf *builtFrame, appendChunk func(*chunk)) {
+	o.env.stats.framesOut.Add(1)
 	h := o.env.slab.get()
 	h.kind = chunkInline
 	copy(h.hdr[:], bf.hdr[:bf.hdrLen])
@@ -658,6 +664,7 @@ func (o *outbound) write() (writeStatus, error) {
 		}
 		if n > 0 {
 			written += n
+			o.env.stats.bytesOut.Add(uint64(n))
 			o.advance(n)
 			o.mu.Lock()
 			o.reservedWire -= n // 写出退还（第二段）
@@ -668,11 +675,13 @@ func (o *outbound) write() (writeStatus, error) {
 		}
 		if err != nil {
 			if errors.Is(err, syscall.EAGAIN) {
+				o.env.stats.writeEAGAIN.Add(1)
 				return writeBlocked, nil
 			}
 			return writeFailed, err
 		}
 		if n < want {
+			o.env.stats.writeEAGAIN.Add(1)
 			return writeBlocked, nil // 内核缓冲满：注册写兴趣，等可写事件
 		}
 	}

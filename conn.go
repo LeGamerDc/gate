@@ -50,6 +50,7 @@ func bindConn[S any](h Handler[S], core *connCore, id uint64, remote netip.AddrP
 	shell := &Conn[S]{id: id, remote: remote, hs: hs}
 	shell.core.Store(core)
 	core.cb = coreCallbacks{
+		onDrain: core.cb.onDrain, // 保留传输层已装的钩子（WS close 帧）
 		onOpen: func() error {
 			s, err := h.OnOpen(shell)
 			if err != nil {
