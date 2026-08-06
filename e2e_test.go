@@ -125,7 +125,80 @@ func startEcho(t *testing.T, mut func(*Options[string]), serverCipher func() Cip
 	return e2eEnv{srv: srv, addr: srv.Addr().String()}
 }
 
-func TestE2E_TCPEchoMatrix(t *testing.T) {
+// wsClient 让 E2E 矩阵在 WebSocket 上跑同一份语料：它把 gate 帧塞进 WS
+// 二进制帧发出，再把服务端的 WS 载荷串起来按 gate 帧解回来。
+type wsClient struct {
+	t    *testing.T
+	ws   *websocket.Conn
+	cdc  codec
+	send Cipher
+	buf  []byte
+	msgs [][]byte
+}
+
+func dialWS(t *testing.T, addr string, sendCi, recvCi Cipher) *wsClient {
+	t.Helper()
+	c, _, err := websocket.DefaultDialer.Dial("ws://"+addr+"/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	cdc := clientCodec(maxMessageSize, maxMessageSize)
+	cdc.requireEncrypt = recvCi != nil
+	return &wsClient{t: t, ws: c, cdc: cdc, send: sendCi}
+}
+
+func (c *wsClient) sendMsgs(msgs ...[]byte) {
+	c.t.Helper()
+	var out []byte
+	for _, m := range msgs {
+		bf, err := buildFrame(append([]byte(nil), m...), 0, nil, false, c.send, maxMessageSize)
+		if err != nil {
+			c.t.Fatal(err)
+		}
+		out = append(out, wire(&bf)...)
+	}
+	if err := c.ws.WriteMessage(websocket.BinaryMessage, out); err != nil {
+		c.t.Fatal(err)
+	}
+}
+
+func (c *wsClient) readMsgs(n int, recv Cipher) [][]byte {
+	c.t.Helper()
+	zdec := mustDecoder(c.t)
+	_ = c.ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for len(c.msgs) < n {
+		mt, data, err := c.ws.ReadMessage()
+		if err != nil {
+			c.t.Fatalf("ws read: %v (已收 %d/%d)", err, len(c.msgs), n)
+		}
+		if mt != websocket.BinaryMessage {
+			c.t.Fatalf("非二进制帧: %d", mt)
+		}
+		c.buf = append(c.buf, data...)
+		for {
+			f, used, ok, perr := c.cdc.parse(c.buf)
+			if perr != nil {
+				c.t.Fatalf("parse: %v", perr)
+			}
+			if !ok {
+				break
+			}
+			if err := c.cdc.deliver(f, recv, zdec, func(msg []byte, _ bool) error {
+				c.msgs = append(c.msgs, append([]byte(nil), msg...))
+				return nil
+			}); err != nil {
+				c.t.Fatalf("deliver: %v", err)
+			}
+			c.buf = c.buf[used:]
+		}
+	}
+	return c.msgs
+}
+
+// 07 第 4 层的端到端矩阵：{TCP, WS} × {无密, Overhead 0, AEAD 16} ×
+// {压缩关/开} × {合包关/开}，同一份语料，逐条对齐。
+func TestE2E_EchoMatrix(t *testing.T) {
 	type cipherPair struct {
 		name   string
 		server func() Cipher // 服务端 OnOpen 里 SetCipher
@@ -143,29 +216,54 @@ func TestE2E_TCPEchoMatrix(t *testing.T) {
 			func() Cipher { _, r := pairGCM(key); return r },
 			func() Cipher { _, r := pairGCM(key); return r }},
 	}
-	for _, pc := range pairs {
-		for _, compress := range []int{0, 64} {
-			for _, cluster := range []int{0, 256} {
-				name := fmt.Sprintf("%s/z%d/c%d", pc.name, compress, cluster)
-				t.Run(name, func(t *testing.T) {
-					env := startEcho(t, func(o *Options[string]) {
-						o.Outbound.CompressThreshold = compress
-						o.Outbound.MaxCluster = cluster
-					}, pc.server)
-					cl := dialTCP(t, env.addr, pc.up(), pc.down())
-					var want [][]byte
-					for i := range 20 {
-						m := bytes.Repeat([]byte{byte('a' + i%26)}, 5+i*17)
-						want = append(want, append([]byte("echo:"), m...))
-						cl.sendMsgs(m)
+	corpus := func() [][]byte {
+		var out [][]byte
+		for i := range 20 {
+			out = append(out, bytes.Repeat([]byte{byte('a' + i%26)}, 5+i*17))
+		}
+		return out
+	}()
+
+	for _, ws := range []bool{false, true} {
+		for _, pc := range pairs {
+			for _, compress := range []int{0, 64} {
+				for _, cluster := range []int{0, 256} {
+					transport := "tcp"
+					if ws {
+						transport = "ws"
 					}
-					got := cl.readMsgs(len(want))
-					for i := range want {
-						if !bytes.Equal(got[i], want[i]) {
-							t.Fatalf("%s 第 %d 条不一致", name, i)
+					name := fmt.Sprintf("%s/%s/z%d/c%d", transport, pc.name, compress, cluster)
+					t.Run(name, func(t *testing.T) {
+						env := startEcho(t, func(o *Options[string]) {
+							o.Outbound.CompressThreshold = compress
+							o.Outbound.MaxCluster = cluster
+							if ws {
+								o.WebSocket = &WebSocketOptions{}
+							}
+						}, pc.server)
+
+						var got [][]byte
+						if ws {
+							cl := dialWS(t, env.addr, pc.up(), pc.down())
+							for _, m := range corpus {
+								cl.sendMsgs(m)
+							}
+							got = cl.readMsgs(len(corpus), pc.down())
+						} else {
+							cl := dialTCP(t, env.addr, pc.up(), pc.down())
+							for _, m := range corpus {
+								cl.sendMsgs(m)
+							}
+							got = cl.readMsgs(len(corpus))
 						}
-					}
-				})
+						for i, m := range corpus {
+							want := append([]byte("echo:"), m...)
+							if !bytes.Equal(got[i], want) {
+								t.Fatalf("%s 第 %d 条不一致", name, i)
+							}
+						}
+					})
+				}
 			}
 		}
 	}
