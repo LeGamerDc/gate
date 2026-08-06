@@ -38,10 +38,10 @@
           │ 入队（复制或移交所有权）
           ▼
    ┌─────────────────┐
-   │  待编码队列      │  []sendMsg，业务消息，尚未编码
+   │  待编码队列      │  []stage1Item：消息 / Frame / cipher barrier
    │  (stage 1)      │
    └────────┬────────┘
-            │            flush：分组 → 压缩 → 加密 → 写帧头
+            │            flush：分组 → 压缩 → 加密 → 帧头（含 WS）落成 chunk
             │            ────────────────────────────────────▶
             ▼
                               ┌──────────────────┐
@@ -62,8 +62,10 @@
   `writev` 写不完时剩下的字节必须原样留着，不能重编码（重编码会得到不同的字节，
   帧流就错位了）。
 
-`Outbound.MaxBuffer` 与 `Writable()` 计的都是 **stage1 + stage2 的总字节数**——
-一个数，一处记账。上一版这里是两处（sender 自己的队列 + 底层连接的出站缓冲），
+`Outbound.MaxBuffer` 与 `Writable()` 比较的都是**同一个数**：`reservedWire`——
+入队时按保守上界扣、编码与写出时分两次退还的在途线路字节记账，
+口径见 [06 的预算模型](06-connection-state-machine.md#预算模型)。
+仍然是一处记账；上一版是两处（sender 自己的队列 + 底层连接的出站缓冲），
 两处各自判断、各自的失败行为，是一个持续的混淆源。
 
 ---
@@ -72,46 +74,72 @@
 
 ### stage 1：待编码队列
 
+stage 1 不是单一的消息数组，而是一个 **tagged union**——`SetCipher` 要在队列里
+留下一个可见的边界（见 [SetCipher barrier](#setcipher队列里的-barrier)）：
+
 ```go
-type sendMsg struct {
+type stage1Item struct {
+	kind itemKind // itemMessage | itemFrame | itemCipherBarrier
+	// itemMessage
 	data                    []byte
 	maskPermit, maskAlready byte
-	owned                   bool  // data 是否来自 gate 的池，需要归还
+	// itemFrame
+	frame *Frame
+	// itemCipherBarrier
+	cipher Cipher
 }
 ```
 
-字段顺序不是随手排的：切片放最前，三个单字节标记挤在尾部的对齐 padding 里。
-反过来会因为切片要 8 字节对齐而在中间垫 6 字节，结构体从 32 涨到 40——队列是一整段
-`[]sendMsg`，每条消息多 8 字节意味着同一次 flush 要多碰 25% 的 cache line。
-
-| 来源 | `data` 从哪来 | `owned` |
-| --- | --- | --- |
-| `Send` / `SendAlone` | 从分级池借一块，复制进去 | true |
-| `SendFunc` | 就是交给 `fill` 的那块，`fill` 返回即入队 | true |
-| `SendFrame` | 指向 `Frame` 的内部字节 | false，改为持有一份 `*Frame` 引用 |
+| 来源 | 载荷 |
+| --- | --- |
+| `Send` / `SendAlone` | `itemMessage`，`data` 从**全局并发安全分级池**借一块复制进去 |
+| `SendFunc` | `itemMessage`，`data` 就是交给 `fill` 的那块（commit 时入队） |
+| `SendFrame` | `itemFrame`，持有一份 `*Frame` 引用 |
+| `SetCipher` | `itemCipherBarrier` |
 
 `maskPermit` 记「允许 gate 做哪些加工」：`Send` 是 `z|c|e`，`SendAlone` 是 `e`
-（**只关掉压缩与合包，不关加密**），`SendFrame` 是 `0`。
-`maskAlready` 记「这些字节已经是什么状态」——`Frame` 若已压缩则带 `z`，
-带 `PreEncrypted()` 则带 `e`。
+（**只关掉压缩与合包，不关加密**）。
+`maskAlready` 记「这些字节已经是什么状态」——`Frame` 若在 `NewFrame` 时已压缩则带 `z`
+（`PreEncrypted` **不**带 `e`：它声明的是业务自理的密文，不复用 gate 的 `e` 位，
+见 [01 的 Frame](01-server-api.md#frame预编码帧与广播)）。
 
 一条消息能进 compound 的条件是 **`maskPermit` 允许合包 且 `maskAlready` 为空**：
 compound 的子帧按协议约定不得携带 `z`/`c`/`e`（见 [02](02-wire-protocol.md#compound)），
 一条「已经压缩好」的消息进了 compound，它的 `z` 标记就再没有地方表达。
+**一个 compound 分组也绝不跨 cipher barrier**——一个合并帧只能用一个密钥。
 
 ### stage 2：待发送链
 
 ```go
+type chunkKind uint8
+const (
+	chunkInline   chunkKind = iota // 帧头（gate 2~4 字节 / WS 2~10 字节），内联存储
+	chunkPooled                    // payload，来自分级池
+	chunkFrame                     // payload，属于某个 *Frame
+)
+
 type chunk struct {
-	buf  []byte  // 线路字节；来自分级池，或 Frame 的内部字节
-	off  int     // 已经写出去多少（部分写）
-	ref  *Frame  // 非 nil 表示 buf 属于这个 Frame，持有它直到写完
-	next *chunk
+	kind  chunkKind
+	off   int32    // 本 chunk 已写出的字节数，唯一的进度表示
+	n     int32    // 有效字节数
+	hdr   [10]byte // kind == chunkInline
+	buf   []byte   // kind == chunkPooled | chunkFrame
+	frame *Frame   // kind == chunkFrame：持有引用防 GC
+	next  *chunk
 }
 ```
 
-严格 FIFO。新编码的结果永远追加在尾部，**绝不插队**——否则部分写留下的半个帧后面
-会跟上别的帧，对端看到的就是错位的流。
+三条不变式（与 [06](06-connection-state-machine.md#出站的精确模型) 一致）：
+
+- **stage 2 里的每一个字节都是最终线路字节。** 编码在入链之前完成——包括 WS 帧头——
+  入链之后不再变换。
+- **`off` 是唯一的进度表示。** 部分写只推进 `off`，永不重新生成任何字节。
+- **严格 FIFO，只在尾部追加**——否则部分写留下的半个帧后面会跟上别的帧，
+  对端看到的就是错位的流。
+
+**帧头内联在 chunk 节点里，不放每-loop 暂存区。** 帧头如果放暂存区，一次部分写之后
+那块暂存已经被别人复用，续写只能重新生成——而重新生成的 WS 帧头会让线路直接错位。
+内联意味着帧头和 payload 一样是持久的线路字节。
 
 ### `Frame` 的生命周期
 
@@ -119,17 +147,31 @@ type chunk struct {
 
 ```
 srv.NewFrame(payload)  → 编码一次（帧头 + 按 server 配置压缩）
-SendFrame              → chunk.ref = f，队列自然持有引用
-该 chunk 写完           → chunk.ref = nil
+SendFrame              → chunk.frame = f，队列自然持有引用
+该 chunk 写完           → chunk.frame = nil
 最后一个引用消失         → GC 回收
 ```
 
 `SendFrame` **失败时不持有引用**（`ErrConnClosed` / `ErrSendQueueFull` /
-`ErrCipherConflict` 都在挂上 `chunk.ref` 之前返回）。实现上要做成结构性的：
+`ErrCipherConflict` 都在挂上 `chunk.frame` 之前返回）。实现上要做成结构性的：
 先做全部检查，最后一步才构造 chunk。
 
 这条规则对 GC 版本只是「不多占一份引用」，代价很小；但如果将来内部改成引用计数，
 它就是配平的关键，所以现在就写进不变式表（O9）。
+
+### SetCipher：队列里的 barrier
+
+「`SetCipher` 在事件循环上调用」**不足以**给密钥切换一个确定的位置——加密发生在
+flush 时，不是入队时，已入队未编码的消息会被新密钥追上（第二轮评审的 P0）。
+切换点必须表达在**队列里**：
+
+- `SetCipher(k)` 往 stage 1 尾部追加一个 `itemCipherBarrier`。
+- 编码器按顺序走：遇到 barrier 就切换当前使用的 cipher，**并结束当前的 compound
+  分组**——一个合并帧不能跨密钥边界。
+- 于是 `Send(A); SetCipher(k); Send(B)` 的语义是精确的：A 用旧密钥，B 用新密钥。
+
+入站方向没有队列问题：cipher 是只在串行域内读写的普通字段，切换对**下一个被解析
+的帧**生效。完整语义见 [06 的 Cipher epoch](06-connection-state-machine.md#cipher-epoch)。
 
 ---
 
@@ -159,15 +201,18 @@ flush 是**幂等**的：队列空就直接返回。所以「入站事件收尾�
 **不需要任何跨线程唤醒**。
 
 ```go
-func (o *outbound) send(m sendMsg) error {
+func (o *outbound) send(it stage1Item) error {
 	o.mu.Lock()
 	// ...配额检查、入队...
 	// arm 唤醒：只有当没人负责 flush 时才需要
 	wake := !o.armed && !o.inLoop && o.conn.writable()
-	if wake { o.armed = true }
+	if wake {
+		o.armed = true
+		o.conn.loop.postDirty(o.conn) // 与 armed 同临界区，见下面的补充规则
+	}
 	o.mu.Unlock()
 
-	if wake { o.conn.loop.postDirty(o.conn) }  // 跨线程：MPSC + 也许一次 notify
+	if wake { o.conn.loop.maybeNotify() } // eventfd / EVFILT_USER 唤醒可以留在锁外
 	return nil
 }
 ```
@@ -192,6 +237,16 @@ o.encode(q)         // → stage 2 → writev
 
 两种情况都有人负责，不存在「既没 arm 也没人 flush」的窗口。这与
 [05](05-websocket.md) 里「握手完成前不可能有消息入队」是同一类结构性论证。
+
+两条补充规则（第二轮评审补上的，缺了会破坏侵入式 dirty 链）：
+
+- **dirty 节点的发布与 `armed` 的置位必须在同一个临界区内完成**（或用 CAS 抢占
+  节点的「在链中」标志）。锁内置 `armed`、锁外 `postDirty` 的写法有一个窗口：
+  事件循环已经 `take()` 并清了 `armed`，另一个 `Send` 于是再 post 一次——
+  同一个连接被挂进 dirty 链两次，而 dirty 节点是内嵌在连接里的侵入式节点，
+  重复挂链直接破坏链表结构。
+- **任何把 `inLoop` 置为 `true` 的路径都必须在批边界用 `defer` 清掉**，
+  否则一次 panic 会让这条连接的唤醒被永久抑制。
 
 > **为什么不做成完全无锁的 in-loop 路径。** 理想形态是「在事件循环线程上 `Send`
 > 直接 append 到一个无同步的本地队列」。做不到，因为 Go 里没有便宜的方式让 `Send`
@@ -259,37 +314,42 @@ for 每条消息:
         if len(out) < len(data):        // 压完更大就用原文
             data, flag = out, flag|z
     if cipher != nil && 允许加密:
-        data = cipher.Seal(池化 dst, data)   // Overhead()==0 时 dst = data[:0]，原地
         flag |= e
-    header := encodeHeader(len(data)); header[0] |= flag
-    → 两个 iovec：{header, data}
+        header := encodeHeader(len(data)+Overhead()); header |= flag  // 先算长度拼头
+        data = cipher.Seal(池化 dst, data, header)  // 帧头做 AAD；Overhead()==0 时原地
+    else:
+        header := encodeHeader(len(data)); header |= flag
+    → 两个 chunk：inline(header) ++ pooled(data)
 ```
 
-一次 `writev` 打包多条消息，最多 `IOV_MAX`（Linux / macOS 都是 1024）个 iovec，
-也就是最多 512 条消息。实现按 chunk 分批，chunk 大小是可调常量。
+一次 `writev` 打包多条消息，最多 `IOV_MAX`（Linux / macOS 都是 1024）个 iovec。
+iovec 数组是每 loop 暂存，只活一次写调用。
 
-`header` 来自**每 loop 一块**的暂存数组，而不是循环体里的局部 `[4]byte`——后者每条
-消息都要单独逃逸一次。`writev` 会读走这些切片，所以每个 header 都必须一直有效到
-写调用返回，按 chunk 划分正好满足。
+`header` 写进该帧的 **inline chunk**（`chunk.hdr`），不来自每-loop 暂存——
+帧头是持久线路字节，必须活到「这个 chunk 完全写出去」，而暂存区在下一次编码就会
+被复用。部分写之后续写的是同一份字节，
+见 [06 的所有权表](06-connection-state-machine.md#字节所有权表)。
 
 ### compound
 
 ```
-body := 4 字节占位 + Σ (子帧头 + 子 payload)     ← 先占住外层头的位置
+body := Σ (子帧头 + 子 payload)      ← 池化缓冲；子头标记位全 0
+flag := c
 if 该压缩:
-    out := encoder.EncodeAll(body[4:], 池化 dst)
+    out := encoder.EncodeAll(body, 池化 dst)
     if len(out) < len(body): body, flag = out, flag|z
 if cipher != nil:
-    body = cipher.Seal(...); flag |= e
-写外层帧头（长度 = 最终字节数），flag |= c
-→ 一个 iovec
+    flag |= e
+    外层头 := encodeHeader(len(body)+Overhead()) | flag   ← 写进 inline chunk
+    body = cipher.Seal(池化 dst, body, 外层头)            ← 帧头做 AAD
+else:
+    外层头 := encodeHeader(len(body)) | flag
+→ 两个 chunk：inline(外层头) ++ pooled(body)
 ```
 
-先占 4 字节再回填，是为了压不压缩都能**就地**写头，省掉一次搬运。
-最终长度 < 4096 时头只要 2 字节，`data = data[2:]` 即可，不必移动 body。
-
-`Overhead() > 0` 的 AEAD 会改变长度，所以**必须先 seal 再写头**，
-见 [02](02-wire-protocol.md#与-aead-的关系)。
+外层帧头在 inline chunk 里，body 缓冲**不需要**预留头部占位——初稿「占 4 字节
+再回填」的技巧随之作废。`Overhead() > 0` 时**必须先算长度、拼出帧头、再 seal**
+（帧头是 AAD），见 [02](02-wire-protocol.md#与-aead-的关系)。
 
 ### 兜底校验
 
@@ -311,6 +371,7 @@ flush:
         if err == EAGAIN:  注册可写事件；返回
         if err != nil:     写失败路径（见下）
         按 n 推进链头的 off，写满的 chunk 出链并归还内存 / 放开 Frame 引用
+        按实际写出的字节数退还预算；更新 lastProgress（stall LRU 移尾）
         if n < 本次请求的总字节: 注册可写事件；返回   ← 内核缓冲满了
     stage 2 空 → 摘掉可写事件注册
 ```
@@ -333,7 +394,7 @@ flush:
 
 ```
 Send 侧（准入控制）
-  stage1 + stage2 + 这条消息的 frameSize > MaxBuffer
+  reservedWire + charge(这条消息) > MaxBuffer
     → 拒绝入队，返回 ErrSendQueueFull       ← 消息没进队列，帧流没有洞
     → gate 不关连接
 
@@ -342,7 +403,8 @@ Send 侧（准入控制）
     → 关闭连接，OnClose(ErrBackpressure)
 ```
 
-以及一条软线：`stage1 + stage2 > HighWater` 时 `Writable()` 返回 false，让业务主动降级。
+以及一条软线：`reservedWire > HighWater` 时 `Writable()` 返回 false，让业务主动降级。
+`charge` 与两段退还的完整口径见 [06 的预算模型](06-connection-state-machine.md#预算模型)。
 
 ### 为什么准入控制不关连接
 
@@ -364,6 +426,12 @@ flush 时发现缓冲超限，然后关闭连接并**丢弃队列里已经接受
 提醒了）；一条一个字节都写不出去的连接是死的。
 
 检查搭在 reactor 已有的定时扫描上，不引入新的时间源，见 [04](04-reactor.md#超时与空闲回收)。
+
+**这个判据只抓「零进度」，有一个已知盲区**：一个每 29 秒读走 1 字节的对端可以
+永久重置计时器，同时占着 `MaxBuffer`。完整的慢客户端保护还需要「最老消息年龄」
+或「持续超过 `HighWater` 的时长」这类判据——v1 不加第三个旋钮，把盲区写在这里，
+并靠 `Limits.MaxOutboundBytes` 兜住它的总代价：单条连接至多占 `MaxBuffer`，
+全体加起来不越过全局预算。
 
 ---
 
@@ -390,28 +458,27 @@ flush 时发现缓冲超限，然后关闭连接并**丢弃队列里已经接受
 
 ## 与 WebSocket 的接口
 
-WS 模式下每次 `writev` 的一批字节要包进一个 WebSocket 二进制帧。接口是一个只有两个
-方法的内部抽象：
+**WS 封帧发生在编码时，不是写时。** 这是第二轮评审后的关键修正——「写时插头 +
+部分写 + 暂存复用」三者组合会重发一个不同的 WS 帧头，线路直接错位：
 
-```go
-type framer interface {
-	// frame 在 vec 前面插入传输层需要的帧头，返回新的 iovec。
-	// 裸 TCP 是恒等变换；WebSocket 插一个 2~10 字节的帧头。
-	frame(scratch *[]byte, vec [][]byte, total int) [][]byte
-}
+```
+flush:
+    seg := encode(stage1)              // 一段 chunk 链，若干条完整 gate 帧
+    if WebSocket:
+        h := WS 帧头 chunk（长度 = seg 的总字节数）
+        seg = h ++ seg                  // 帧头也是一个持久 chunk
+    stage2.append(seg)
 ```
 
-**一次 `writev` 的一整批 gate 帧装进一个 WS 二进制消息**，而不是每条 gate 帧一个
-WS 帧。gate 的帧本身是自定界的，所以外层用一个 WS 帧就够；这样 WS 帧头从「每条消息
-2~10 字节」降到「每批 2~10 字节」。
+于是 stage 2 是一条**纯字节链**，`writev` 完全不需要知道 WebSocket 的存在，
+部分写只是推进 `off`。三个连带结论：
 
-分批（`IOV_MAX`）导致一次 flush 拆成多次 `writev` 时，每一批各自成为一个 WS 二进制
-消息——这是合法的，对端把它们的 payload 首尾相接就还原成同一个 gate 字节流。
-
-WS 帧头的暂存也是**每 loop 一份**，不挂在连接上：它只在一次写调用期间有用，
-而所有出站写都发生在连接自己的事件循环上且中途不让出，所以池里同时在外的对象数
-等于事件循环数，不随连接数增长。挂成连接级字段的话，十万连接光这一块就要白占
-一百多 MB。
+- **一次编码的一整批 gate 帧装进一个 WS 二进制帧**：WS 帧头从「每条消息 2~10 字节」
+  摊到「每批 2~10 字节」。
+- **每个 WS 二进制帧一定结束在 gate 帧边界上**——它包的就是整数条 gate 帧。
+  这让 [05 的「不做分片重组」论证](05-websocket.md#入站帧层)只依赖 fragment 等价。
+- `IOV_MAX` 的分批发生在 `writev` 层，**不影响 WS 分帧**：一个 WS 帧跨多次
+  `writev` 发出去完全正常。
 
 细节见 [05-websocket](05-websocket.md#出站封帧)。
 
@@ -423,17 +490,21 @@ WS 帧头的暂存也是**每 loop 一份**，不挂在连接上：它只在一�
 
 | 内存 | 来源 | 归还时机 |
 | --- | --- | --- |
-| `Send` 的复制目标 | 分级池 | 该消息编码完成后 |
-| 压缩输出 | 分级池 | 该帧写出后 |
-| AEAD 的 `dst` | 分级池 | 同上 |
-| compound body | 分级池 | 该帧写出后 |
-| iovec 数组、header 暂存 | **每 loop 一份**的暂存对象 | 一次写调用结束 |
+| `Send` 的复制目标 | **全局并发安全**分级池 | **该 chunk 完全写出**后——不压缩不加密不合包时它就是线路字节 |
+| 压缩输出 | 每 loop 分级池 | 该 chunk 写完出链 |
+| AEAD 的 `dst` | 每 loop 分级池 | 同上 |
+| compound body | 每 loop 分级池 | 同上 |
+| 帧头（gate / WS） | **chunk 节点内联** | 随 chunk 出链 |
+| iovec 数组 | **每 loop 一份**的暂存对象 | 一次写调用结束 |
 | chunk 节点 | 每 loop 的 slab | 该 chunk 写完 |
-| stage 1 队列 `[]sendMsg` | 每 loop 的池 | flush 完成 |
+| stage 1 队列 `[]stage1Item` | 每 loop 的池 | flush 完成 |
 | zstd 编码器 | **每 loop 一个**，concurrency=1 | 常驻 |
 
 跨调用的暂存空间**一律按事件循环池化，不挂成连接级字段**——这是 10 万连接下的
 硬要求，理由见 [01 的内存预算](01-server-api.md#按事件循环增长的内存不随连接数增长)。
+**唯一的例外**是 `Send` / `SendFunc` 的复制目标：入队可能发生在任意 goroutine 上，
+这块内存必须来自**并发安全的全局分级池**（在别的 goroutine 上取、在 loop 上放），
+见 [06 的所有权表](06-connection-state-machine.md#字节所有权表)。
 
 `Frame` 是唯一跨连接、跨 loop 共享的对象，但它**由 GC 管理**（见
 [01 的 D20](01-server-api.md#d20-frame-由-gc-管理不公开引用计数)）：chunk 持有一个
@@ -452,13 +523,16 @@ WS 帧头的暂存也是**每 loop 一份**，不挂在连接上：它只在一�
 | O2 | stage 2 是严格 FIFO，任何新数据只追加在尾部 |
 | O3 | 部分写的字节永不重编码；`off` 是唯一进度 |
 | O4 | 所有出站写都发生在连接所属的事件循环上；跨线程路径只入队与标脏，**永不触碰 fd** |
-| O5 | `MaxBuffer` / `HighWater` 计的是 stage1 + stage2 的总字节，一处记账 |
+| O5 | `MaxBuffer` / `HighWater` / `Writable()` 比较的都是 `reservedWire`（保守上界、两段退还），一处记账 |
 | O6 | 一切计量用 `frameSize`（payload + header），不用 `len(payload)` |
 | O7 | compound body 的字节数、`MaxCluster` 的比较口径、外层帧头的长度值是同一个数 |
 | O8 | 写失败之后立刻停止投递；先关 outbound，再关连接 |
 | O9 | `SendFrame` 失败时不 retain；调用方不需要为失败路径配平 |
 | O10 | flush 幂等：队列空即返回 |
 | O11 | 连接不可写时不可能有消息入队（见 [05](05-websocket.md#握手与可写时机)） |
+| O12 | stage 2 的每个字节都是最终线路字节：帧头内联在 chunk，WS 封帧在编码时 |
+| O13 | 一个 compound 分组绝不跨 cipher barrier |
+| O14 | dirty 节点的发布与 `armed` 置位在同一临界区；`inLoop` 由 `defer` 清 |
 
 ---
 
@@ -509,10 +583,12 @@ Go 里做不到；退而求其次的 `Reply()` 软契约用错了是静默数据
 **这修正了 01 里的描述**：`MaxBuffer` 不再是「越过即关闭连接」，而是准入线；
 `ErrBackpressure` 这个关闭原因改由 `StallTimeout` 触发。
 
-### O-D5. 一次 `writev` 的一批 gate 帧装进一个 WS 帧
+### O-D5. 一批 gate 帧装进一个 WS 帧，且封帧发生在编码时
 
 WS 帧头从「每条消息」摊到「每批」。gate 帧自定界，所以外层一个 WS 帧就够。
-上一版已经这样做了，这里把它写成规格。
+上一版已经这样做了；这一版把**时机**修正为编码时——初稿放在 `writev` 时、
+帧头存每-loop 暂存，与部分写组合会重发一个不同的 WS 帧头（第二轮评审的 P0），
+见[与 WebSocket 的接口](#与-websocket-的接口)。
 
 ### O-D6. 跨线程路径永不触碰 fd
 

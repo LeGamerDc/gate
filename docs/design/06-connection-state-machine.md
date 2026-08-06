@@ -125,9 +125,9 @@
 | `SendFunc` | — | — | —¹ | ✓ | ✗ | ✗ | ✗ |
 | `Post` | — | — | —¹ | ✓（暂停时排队） | 丢弃 | 丢弃 | 丢弃 |
 | `AsyncDo` | — | — | — | ✓ / `ErrAsyncBusy` | ✗ | ✗ | ✗ |
-| `Pause` | — | — | — | ✓ | ✗ | ✗ | ✗ |
+| `Pause` | — | — | — | ✓ | ✗³ | ✗³ | ✗³ |
 | `resume` | — | — | — | ✓ | ✓² | ✓² | no-op |
-| `Close` | — | ✓ | ✓ | ✓ | no-op | no-op | no-op |
+| `Close` | — | ✓⁴ | ✓⁴ | ✓ | no-op | no-op | no-op |
 | `SetCipher` | — | — | — | ✓ | ✗ | ✗ | ✗ |
 | `Writable` | — | — | — | ✓ | false | false | false |
 
@@ -136,6 +136,14 @@
 
 ² `resume` 在 `Draining` / `Detached` 下仍然有效——它可能正是解锁 `Detached → Closed`
 的那一步。
+
+³ `Pause` 没有 error 返回值，这里的 ✗ 表示「返回一个 no-op 的 `resume`」。
+
+⁴ `Proxy` / `Handshaking` 下业务还拿不到 `*Conn`，这里的 ✓ 指内部关闭路径
+（超时、`Shutdown`、对端断开）。
+
+`ID` / `Remote` / `Handshake` 读的是壳上的不可变字段（见 [Conn 的壳与核](#conn-的壳与核)），
+任何状态下——包括 `Closed`——都可用。
 
 ### 迁移触发表
 
@@ -149,18 +157,22 @@
 | `Open` | `OnMessage` 返回 error / `Close(r)` / 空闲 / stall / 协议错误 / panic / `Shutdown` | `Draining` | 记录 `reason`；停止入站投递；停止接受新消息入队 |
 | `Draining` | 出站排空 | `Detached` | 见下 |
 | `Draining` | `CloseLinger` 到期 / 写失败 | `Detached` | 丢弃剩余出站 |
-| `Detached` | 无在途 `AsyncDo` | `Closed` | `OnClose(c, reason)`；core 置 nil |
+| `Detached` | 无在途 `AsyncDo` | `Closed` | `OnClose(c, reason)`（core 已在进入 `Detached` 时置 nil） |
 
 `Draining → Detached` 的动作序列（**顺序是规格**）：
 
 ```
 1. 若 WS 且 reason 属于「可以发 close 帧」的一类 → 已在进入 Draining 时排进出站链
-2. poller.del(fd) → close(fd)
-3. 丢弃 stage1 / stage2，归还全部池内存，退还预算
-4. 从五条 LRU 上摘除；槽位 conn 置 nil；槽位 gen++
-5. 若 AsyncBusy → 挂进 loop 的 pendingClose 链，等 resume
+2. conn.core 置 nil            ← 从此所有需要活连接的方法返回 ErrConnClosed / no-op
+3. poller.del(fd) → close(fd)
+4. 丢弃 stage1 / stage2，归还全部池内存，退还预算
+5. 从五条 LRU 上摘除；槽位 conn 置 nil；槽位 gen++
+6. 若 AsyncBusy → 挂进 loop 的 pendingClose 链，等 resume
    否则 → 直接进入 Detached → Closed
 ```
+
+`resume` 解锁 pendingClose 的控制项**直接携带 connCore / pendingClose 节点引用**，
+不走 slot + generation——第 5 步已经 gen++，token 校验会把它当陈旧事件丢弃。
 
 ---
 
@@ -176,6 +188,7 @@
 | `rbuf`（每 loop 64KB） | loop 常驻 | 永久 | 不归还 | 否 |
 | `carry`（入站残片） | **全局并发安全分级池** | 跨事件，直到拼齐一帧 | 拼齐或连接销毁 | 否（只在 loop 上取放） |
 | `frameBuf`（大帧目标缓冲） | 全局分级池 | 从「知道长度」到「投递完成」 | 投递后 | 否 |
+| WS 控制帧暂存（≤125B） | 分级池 | 跨读事件收齐一个控制帧 | 处理完立即 | 否 |
 | 解密输出 | 原地（`Overhead()==0`）或分级池 | `deliver` 期间 | `deliver` 返回 | 否 |
 | 解压输出 | 分级池 | `deliver` 期间 | `deliver` 返回 | 否 |
 | 交给 `OnMessage` 的 `msg` | 上述之一的**切片**（三索引封 cap） | **仅本次调用** | 不归还（借用） | 否 |
@@ -311,7 +324,9 @@ onReadable():
     n := read(fd, rbuf[carryLen:])        ← 小帧快路径：拼上残片后原地解析
     data := rbuf[:carryLen+n]
     loop:
-        解析帧头 → 不足 4 字节则把 data 存回 carry，返回
+        解析帧头：不足 2 字节 → 存回 carry 返回；m = 1 且不足 4 字节 → 同上
+                  （2 字节就能定界一条 m=0 的帧——「攒够 4 字节再说」会让
+                    单发的 2 字节空帧永远卡在 carry 里，见 02 校验规格第 1~4 步）
         校验（见 02 的校验规格）
         if 整帧都在 data 里:  原地 deliver，data 前移
         else if 帧长 <= rbuf 容量:  把 data 存回 carry，返回     ← 下一轮就够了
@@ -335,16 +350,20 @@ onReadable():
 远大于单条 `MaxMessage`。
 
 ```
-每连接的 WS 状态（全部是标量，没有缓冲）：
+每连接的 WS 状态：
     remaining   int64    // 当前 WS 帧还剩多少 payload
     mask        [4]byte
     maskOff     uint8    // 跨读事件的掩码偏移
     fragmented  bool     // 是否处在一条分片消息中间
     hdrBuf      [14]byte, hdrLen
+    ctrl        []byte   // 仅控制帧跨读事件时存在（分级池，≤125 字节）
 ```
 
-WS 级残片**最多 14 字节**（一个最长的帧头），不是一个完整帧。
-payload 一到就地去掩码并喂给 gate 帧循环。
+**数据帧完全流式**：payload 一到就地去掩码并喂给 gate 帧循环，一个字节都不缓冲。
+**控制帧必须整帧收齐再处理**——pong 要回显 payload，close 要解析 code / reason；
+RFC 把控制帧 payload 封在 125 字节以内，跨读事件时借一块小暂存，处理完立刻归还。
+
+WS 级残片的上界因此是 **14 字节帧头 + 至多 125 字节控制帧暂存**，与 `MaxMessage` 无关。
 
 由此：
 
@@ -369,10 +388,17 @@ payload 一到就地去掩码并喂给 gate 帧循环。
 入队时不知道压缩能省多少，所以按**最坏情况**扣：
 
 ```
-charge(payload) = frameSize(len(payload) + cipher.Overhead())
+charge(payload) = frameSize(len(payload) + cipher.Overhead()) + wireSlack
 ```
 
-编码完成后知道了真实线路长度，**退还差额**；写出去之后，按实际写出的字节数继续退还。
+- `cipher` 取**队尾生效的那个**（最后一个 cipher barrier 之后的）——`Send` 与
+  `SetCipher` 都在 outbound 锁下线性化，这个读取是确定的。
+- `wireSlack` 是常数：裸 TCP 下 4，WS 下 14。它覆盖本消息可能分摊到的**帧级头部**：
+  compound 外层帧头（≤4 字节）不属于任何一条子消息，WS 帧头（≤10 字节）不属于
+  任何一条 gate 帧。少了它，「reservedWire ≥ 真实占用」会以每帧几个字节的差距失守。
+
+编码完成后知道了真实线路长度（此刻 WS 封帧已完成，线路字节精确可知），
+**退还差额**；写出去之后，按实际写出的字节数继续退还。
 于是 `reservedWire` 始终 ≥ 真实占用，准入控制不会因为「压缩后其实放得下」而失效，
 也不会因为「AEAD 撑大了」而超限。
 
@@ -472,8 +498,8 @@ type Cipher interface {
 ## 截止时刻
 
 **五条每 loop 的侵入式 LRU + 一个 loop 级 backoff**，全部 O(1) 更新、O(k) 过期。
-不需要时间堆，也不需要 `timerfd` / `EVFILT_TIMER`——每轮取五者最近的那个当作
-`wait` 的 timeout。
+不需要时间堆，也不需要 `timerfd` / `EVFILT_TIMER`——每轮取六个时间源
+（五条链表头 + backoff）里最近的那个当作 `wait` 的 timeout。
 
 | 类别 | 链表按什么排序 | 何时入链 | 何时移到尾部 |
 | --- | --- | --- | --- |
@@ -596,13 +622,17 @@ type Cipher interface {
 
 ```go
 type Conn[S any] struct {
-	State S
-	id    uint64
-	core  atomic.Pointer[connCore]   // Detached 时置 nil
+	State  S
+	id     uint64
+	remote netip.AddrPort           // 进入 Open 前定值，此后不可变
+	hs     *Handshake               // 同上；非 WS 为 nil
+	core   atomic.Pointer[connCore] // 进入 Detached 时置 nil
 }
 ```
 
-- 所有方法先 `core.Load()`，为 nil 就返回 `ErrConnClosed` 或 no-op。
+- 需要活连接的方法先 `core.Load()`，为 nil 就返回 `ErrConnClosed` 或 no-op。
+- `ID` / `Remote` / `Handshake` 只读壳上的不可变字段，**不经过 core**——
+  `OnClose` 里打日志、业务事后清理，在 `Detached` / `Closed` 下照常可用。
 - `Draining → Detached` 时**先**把 `core` 换成 nil，**再**归还 loop 资源。
 - 于是一个泄漏的 `Conn` 只钉住它自己的壳和 `State`。
 
@@ -614,6 +644,9 @@ type Conn[S any] struct {
 ## 对 01–05 的勘误
 
 以本文为准。下面每一条都是前面文档里**写错或写漏**的地方。
+（复核后已**全部回改**进 01–05，本表保留作评审记录；此外复核还修正了本文自身的
+几处缺陷：壳/核置 nil 时机、`resume` 解锁 `Detached` 不走 token、2 字节帧头的
+增量解析、`charge` 的 `wireSlack`、WS 控制帧暂存。）
 
 ### 出站
 
@@ -632,7 +665,7 @@ type Conn[S any] struct {
 | 文档 | 原表述 | 更正 |
 | --- | --- | --- |
 | 04 | 残片拷回 64KB `rbuf` 头部再继续读 | 大帧一次性申请目标缓冲直读；`carry` 上界是 rbuf 容量而非 `MaxMessage` |
-| 05 | 等一个完整 WS 帧再 emit | **流式**：WS 级残片最多 14 字节 |
+| 05 | 等一个完整 WS 帧再 emit | **流式**：WS 级残片 ≤ 14 字节帧头 + 至多 125 字节控制帧暂存 |
 | 05 | WS payload 上限 = `MaxMessage` | `MaxMessage` 只约束 gate payload；WS 帧长另设宽松上界 |
 
 ### 加密

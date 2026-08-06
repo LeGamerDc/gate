@@ -53,7 +53,9 @@
   不需要同步。唯一的例外是出站队列的入队口——那是给跨 goroutine `Send` 用的，
   用一把无争用的锁（见 [03](03-outbound.md#in-loop-快路径)）。
 - 统计计数器每 loop 一份，不存在跨核往返。
-- 内存池每 loop 一份，分配与释放都在同一个线程上，不需要原子操作。
+- 内存池**几乎**每 loop 一份，分配与释放都在同一个线程上，不需要原子操作。
+  唯一的例外是 `Send` / `SendFunc` 的复制目标——它们可从任意 goroutine 入队，
+  必须走并发安全的全局分级池（见 [06 的所有权表](06-connection-state-machine.md#字节所有权表)）。
 - **所有系统调用都发生在 loop 线程上。** 这一条把上一版为「陈旧连接对象碰到已被
   回收甚至已被新连接复用的 fd」写的那一整类防御，变成了结构性事实。
 
@@ -115,6 +117,11 @@ kqueue 那一行是实现上最容易出错的地方：epoll 的 `mod` 是「设
 kqueue 是「对每个 filter 分别开关」。抽象层必须记住当前的 `interest`，
 把 `mod` 翻译成一组增量的 `EV_ENABLE` / `EV_DISABLE`，而不是每次都全量重设。
 
+还有一条 kqueue 特有的坑：**同一个 fd 的读、写就绪是两个独立事件**（两个 filter
+各报各的），`wait` 的实现必须按 `token` 把它们**聚合成一个 `event`**——上层承诺
+「先写后读」的处理顺序（见[写路径](#写路径)），聚合是这个承诺的前提。
+epoll 天然是合并的，一个 fd 一个 event。
+
 ---
 
 ## 一轮迭代
@@ -122,7 +129,7 @@ kqueue 是「对每个 filter 分别开关」。抽象层必须记住当前的 `
 ```
 loop.run():
   for {
-      timeout := 下一个截止时刻 - now        ← 空闲 / 握手 / Pause / Stall 四类超时的最近者
+      timeout := 下一个截止时刻 - now        ← 五条 LRU 头 + EMFILE backoff 的最近者
       n := poller.wait(events, timeout)
 
       ── 阶段 1：分发事件 ────────────────────────────────
@@ -139,10 +146,11 @@ loop.run():
       for c in dirty 链: c.flush()               ← 幂等，阶段 1 flush 过的直接返回
 
       ── 阶段 3：超时扫描 ────────────────────────────────
-      到点才做：空闲 LRU 头部、握手超时、Pause 超时、出站 stall
+      到点才做：idle / handshake / pause / stall / linger 五条 LRU 的头部
 
       ── 阶段 4：回收 ───────────────────────────────────
-      for c in reap 链: 摘注册 → close(fd) → OnClose → 归还内部资源
+      for c in reap 链: 执行 Draining → Detached 的拆除序列（见关闭流程）
+                        fd、缓冲、槽位立即回收；OnClose 视串行域是否空闲
   }
 ```
 
@@ -189,6 +197,9 @@ loop_i: socket() → SO_REUSEPORT → bind(addr) → listen() → 注册到自�
    让这件事可观测。真的倾斜到需要处理时，可以上 `SO_ATTACH_REUSEPORT_CBPF`
    自定义分发——那是后续优化，不在 v1。
 
+3. **`Addr = ":0"`（随机端口）不能让每个 listener 各自 bind 0**——那样每个会拿到
+   **不同的**端口。第一个 listener bind 0 取回真实端口，其余 listener 绑同一个端口。
+
 ### macOS：单 listener + 轮转投递
 
 Darwin **没有** Linux 那种内核级 accept 负载均衡（FreeBSD 的对应物是
@@ -212,6 +223,8 @@ loop_0 持有唯一的 listener
   没 accept 完不要紧，水平触发下一轮还会再报。
 - **`MaxConns` 先原子占位再 accept。** check-then-add 在多 loop 下不是原子的，
   并发的 accept 会全部读到低于上限的计数、全部放行，一次连接风暴就能冲破上限。
+  满额时也**必须** `accept` 之后立刻 `close`（明确拒绝），不能只是跳过——
+  连接留在内核 backlog 里，水平触发会每轮都报 listener 可读，空转。
 - **`EMFILE` 必须特殊处理。** fd 耗尽时 `accept` 返回 `EMFILE`，而连接仍然挂在
   内核的 accept 队列里，水平触发会**立刻再次报告可读**——一个满载 CPU 的死循环，
   而且日志会瞬间刷爆。处理方式：
@@ -221,8 +234,11 @@ loop_0 持有唯一的 listener
   遇到 EMFILE:
       close(预留 fd) → accept() 拿到那条连接 → 立刻 close 它（明确拒绝）
       → 重新打开预留 fd
-      → 摘掉 listener 的读兴趣，等下一轮再恢复      ← 避免继续空转
+      → 摘掉 listener 的读兴趣，进入指数退避      ← loop 级 backoff 时刻，到点恢复
   ```
+
+  `ENFILE` / `ENOBUFS` / `ENOMEM` 走同一条路径——它们都是「资源暂时耗尽、
+  立刻重试必然再失败」的形态，只是耗尽的资源不同。
 
   这是 10 万连接下的真实故障模式，不是理论问题：`ulimit -n` 配小了、或者 fd 泄漏，
   都会走到这里。
@@ -231,15 +247,26 @@ loop_0 持有唯一的 listener
 
 ## 读路径
 
+入站解析是**增量状态机**，不是「攒够一整帧再解析」——固定 64KB 的 rbuf 装不下
+一条 1MB 的帧，而反复把增长中的残片拷来拷去是 O(n²)。完整规格见
+[06 的入站模型](06-connection-state-machine.md#入站的精确模型)：
+
 ```
 每 loop 一块 64KB 读缓冲（rbuf）
-  ├─ 若该连接有残片：先把残片拷进 rbuf 头部
+
+小帧快路径（帧长 <= rbuf 容量）：
+  ├─ 若该连接有残片（carry）：先拷进 rbuf 头部
   ├─ read(fd, rbuf[残片长度:])
   ├─ 在 rbuf 上**原地**解析出一条条完整帧 → 交给业务
-  └─ 剩下不足一帧的尾巴 → 拷进该连接的残片缓冲（从分级池借）
+  └─ 剩下不足一帧的尾巴 → 存回 carry（从分级池借）
+
+大帧路径（帧长 > rbuf 容量）：
+  ├─ 帧头校验通过后，一次性从分级池申请整帧目标缓冲（frameBuf）
+  ├─ 后续 read 直接填 frameBuf 的剩余区——没有重复拷贝
+  └─ 收齐 → 投递 → 归还
 ```
 
-**稳态下残片是空的**，因此 10 万条连接的入站内存占用是 **0**——读缓冲是每 loop 一块，
+**稳态下 carry 是空的**，因此 10 万条连接的入站内存占用是 **0**——读缓冲是每 loop 一块，
 不是每连接一块。这是这个量级下最重要的一条内存性质。
 
 ### 水平触发 + 读取预算
@@ -260,9 +287,12 @@ loop_0 持有唯一的 listener
 代价是每轮事件多一次 `read` 系统调用（那次返回 `EAGAIN` 的）——除非用读取预算提前
 让出，那连这一次都省了。
 
-### 残片的上界
+### 残片与大帧缓冲的上界
 
-- 未 `Pause` 时：残片必然小于一条完整帧，由 `Limits.MaxMessage` 封顶。
+- **carry 的上界是 rbuf 容量（64KB），不是 `MaxMessage`**——超过 rbuf 的帧走大帧
+  路径直读 frameBuf，carry 里永远只有「不足一帧且装得进 rbuf」的尾巴。
+- **frameBuf 的上界是 `Limits.MaxMessage`**：帧头校验（含长度）在申请之前完成，
+  谎报长度换不来分配。
 - `Pause` 时：本轮已经读进 `rbuf`、但来不及投递的字节要全部转进残片缓冲，
   由 `Limits.MaxPending` 封顶，超过即关闭（`ErrPendingOverflow`）。
 
@@ -326,7 +356,9 @@ push 进来的项目，其生产者会看到 `armed == true` 而跳过 `notify`�
 
 ### `Post` 的两条排队规则
 
-1. **连接已关闭 ⇒ 闭包不执行、不报错。** 执行前校验 generation 即可。异步回来发现
+1. **连接已关闭 ⇒ 闭包不执行、不报错。** 执行前**同时**校验 generation 与主状态——
+   gen 到 `Detached` 才递增，而 `Draining` 从 `Close` 线性化那一刻就可能开始，
+   只查 gen 会留下一个「已承诺关闭但闭包仍执行」的窗口。异步回来发现
    会话没了是常态，不该让每个调用点都写一遍判断。
 2. **连接处于暂停中 ⇒ 闭包排进该连接的待执行队列**，`resume` 之后按投递顺序执行。
 
@@ -342,18 +374,23 @@ push 进来的项目，其生产者会看到 `armed == true` 而跳过 `notify`�
 ### 句柄：槽位 + generation
 
 ```go
-type token uint64   // 高 32 位 generation，低 32 位槽位下标
+type token uint64   // 位段划分：kind(2) | generation(30) | slot(32)
+                    // kind ∈ { listener, notify, conn }——事件分发第一步就靠它
 
-type slot struct {
+type slot struct {   // 64 位上 16 字节（指针 + uint32 + padding）
 	conn *Conn
 	gen  uint32
 }
-// loop.slots []slot ——按 fd 下标索引
+// loop.slots []slot ——按 loop 内自管的稠密下标索引（freelist 分配）
 ```
 
-内核分配 fd 时总是取**当前最小的空闲值**，所以 fd 是稠密的，可以直接当数组下标：
-O(1) 查表，没有哈希，没有 map。每次槽位被复用就 `gen++`，事件里带回来的 `token`
-和槽位当前的 `gen` 对不上就说明这是一个陈旧事件，直接丢弃。
+**槽位下标不是 fd。** fd 只在**进程**内稠密（内核总是取最小空闲值），不在
+**每个 loop** 内稠密——连接被摊到 N 个 loop 之后，单个 loop 看到的 fd 序列满是洞，
+按 fd 索引就要每个 loop 都开一个「全进程最大 fd 号」大小的数组，×N 份。
+每个 loop 用自己的 freelist 分配稠密下标，事件回来仍是 O(1) 查表、零哈希、零 map。
+
+每次槽位被复用就 `gen++`，事件里带回来的 `token` 和槽位当前的 `gen` 对不上就说明
+这是一个陈旧事件，直接丢弃。
 
 ### 三个「唯一」不要混淆
 
@@ -389,31 +426,34 @@ O(1) 查表，没有哈希，没有 map。每次槽位被复用就 `gen++`，事
 
 ### 关闭流程
 
+与 [06 的主状态机](06-connection-state-machine.md#主状态)逐字对齐：
+`Open → Draining →（排空 / linger 到期 / 写失败）→ Detached → Closed`。
+
 ```
 任何阶段决定关闭:
     if !c.closing.swap(true):     ← 幂等，第一个 reason 生效
-        c.reason = reason
-        挂进 loop 的 reap 链
+        记录 reason；停止入站投递；停止接受新消息入队
+        若 WS 且 reason 可发 close 帧 → close 帧排进出站链尾（见 05）
+        进入 Draining：尝试写一次，挂进 linger 链
+        ← 之后只在「可写事件」或「CloseLinger 到期」时再动，不空转
 
-阶段 4（回收）—— 分两步，可以隔开任意长的时间：
+Draining → Detached（排空 / 超时 / 写失败触发；一定发生，不等任何业务代码）:
+    1. conn.core 置 nil           ← 公共方法从此返回 ErrConnClosed / no-op
+    2. poller.del(fd) → close(fd)
+    3. 丢弃 stage1 / stage2，归还池内存，退还预算
+    4. 从五条 LRU 摘除；槽位 conn 置 nil；槽位 gen++
 
-  【A】拆 socket（一定发生，不等任何业务代码）
-    1. 若是 WebSocket 且属于正常关闭 → 尝试写一个 close 帧（见 05）
-    2. 出站队列非空且未超 CloseLinger → 再尝试写一次，写不完就下一轮再来
-    3. poller.del(fd) → close(fd)
-    4. 归还内部资源（读残片、出站 chunk、槽位 gen++）；从各条 LRU 摘除
-
-  【B】通知业务（可能被推迟）
-    5. 若该连接仍处于 AsyncDo 暂停中 → 挂进 loop 的 pendingClose 链，等 resume
-    6. OnClose(c, reason)          ← 恢复屏障包住
-    7. 放开对 Conn 对象的最后一个引用
+Detached → Closed（可能被推迟）:
+    5. 若仍有在途 AsyncDo → 挂进 loop 的 pendingClose 链，等 resume
+       （resume 的控制项直接携带 core 引用，不走 token——gen 已在第 4 步递增）
+    6. OnClose(c, reason)          ← 恢复屏障包住；壳上的 ID/Remote/Handshake 仍可读
 ```
 
-第 2 步是 `Outbound.CloseLinger` 的落点：连接会在 reap 链上多停留几轮，
-直到排空或超时。它保证了「回一条拒绝消息再关闭」这个模式**至少被尝试过**——
+`Draining` 是 `Outbound.CloseLinger` 的落点：连接在 linger 链上停留，直到排空或
+超时。它保证了「回一条拒绝消息再关闭」这个模式**至少被尝试过**——
 但不保证送达，见 [01](01-server-api.md#尽力-flush到底承诺了什么)。
 
-**A 与 B 分开是 `AsyncDo` 串行域保证的实现基础**（[01 的 D18](01-server-api.md#d18-把-asyncdo-的函数体拉进串行域)）：
+**`Detached` 与 `Closed` 分开是 `AsyncDo` 串行域保证的实现基础**（[01 的 D18](01-server-api.md#d18-把-asyncdo-的函数体拉进串行域)）：
 `f` 正在另一个 goroutine 上跑时不能调 `OnClose`，否则两者会在业务状态上撞车。
 但也**不能因此推迟拆 socket**——fd 和缓冲必须立刻回收，10 万连接的规模下这些资源
 一刻都等不起。所以「拆资源」立刻做，「通知业务」排队等。
@@ -425,7 +465,9 @@ O(1) 查表，没有哈希，没有 map。每次槽位被复用就 `gen++`，事
 
 ## 超时与空闲回收
 
-四类超时，共用**一条**每 loop 的侵入式链表加几个游标，不引入任何时间堆或时间轮。
+**五条每 loop 的侵入式 LRU + 一个 loop 级 backoff 时刻**，全部 O(1) 更新、
+O(k) 过期，不引入任何时间堆或时间轮（完整表见
+[06 的截止时刻](06-connection-state-machine.md#截止时刻)）。
 
 ### 空闲回收用 LRU 链表
 
@@ -444,18 +486,20 @@ O(1) 查表，没有哈希，没有 map。每次槽位被复用就 `gen++`，事
 活跃的判据是**「交付了一条完整消息」**，不是「收到了字节」。两个后果：
 只发半个帧吊着连接的 slowloris 会被回收；反过来，服务端单向下推不会让连接显得活跃。
 
-### 另外三类
+### 另外四条
 
 | 超时 | 结构 | 说明 |
 | --- | --- | --- |
-| `HandshakeTimeout` | 单独一条 LRU（握手中的连接） | 握手期的连接一条完整消息都没交付过，**空闲 LRU 管不到它**，必须单列 |
+| `HandshakeTimeout` | 单独一条 LRU（`Proxy` / `Handshaking` 的连接） | 握手期的连接一条完整消息都没交付过，**空闲 LRU 管不到它**，必须单列 |
 | `MaxPause` | 单独一条 LRU（被暂停的连接） | 暂停期间刻意不计入空闲时长，同样脱离了空闲 LRU 的管辖 |
-| `StallTimeout` | 复用「有写兴趣的连接」这个集合 | 出站积压非空的连接本来就都在写兴趣集合里，扫它就够，不需要第五条链表 |
+| `StallTimeout` | 单独一条 LRU，按 `lastProgress` 排序 | 初稿写「复用写兴趣集合」——**错了**：那个集合没有时间序，扫描无法在第一个未超时处停下。`lastProgress`（最后写出 ≥1 字节的时刻）满足单调性，可以成链 |
+| `CloseLinger` | 单独一条 LRU（`Draining` 的连接） | 初稿把它挂在 reap 链上每轮重试写——**错了**：别的连接持续活跃时，每轮都对一个满缓冲的 fd 撞一次 `EAGAIN`，是 syscall 风暴。linger 链上的连接**只在两种时机动**：收到可写事件，或 `CloseLinger` 到期 |
 
-三者都是 [01 的 D23](01-server-api.md#d23-补齐三个无人管辖的时间窗口) 说的
+前三者都是 [01 的 D23](01-server-api.md#d23-补齐三个无人管辖的时间窗口) 说的
 「无人管辖的时间窗口」。共同点是：**连接存在，但它不满足任何现有回收机制的判据。**
 
-每轮迭代把四类超时里最近的那个截止时刻算出来，作为 `wait` 的 timeout。
+另有一个 loop 级的 **EMFILE backoff 时刻**（见 [accept](#accept)）。
+每轮迭代取六个时间源（五条链表头 + backoff）里最近的截止时刻，作为 `wait` 的 timeout。
 
 ---
 
@@ -469,14 +513,22 @@ Pause():
         从空闲 LRU 摘除，挂进 pause LRU
         记录暂停开始时刻
 
-resume():
+resume():                                ← 可从任意 goroutine 调用
+    once 保证幂等 → 投递一个「resume 控制项」到 loop 收件箱
+    （控制项直接携带 core 引用，不走 token——连接可能已 Detached、槽位已复用）
+
+loop 处理 resume 控制项（串行域内）:
     if --depth == 0:
         从 pause LRU 摘除
         执行暂停期间排队的 Post 闭包        ← 串行域按序恢复
-        若连接已被关闭（挂在 pendingClose 上）→ 走回收阶段 B，到此为止
+        若连接已在 pendingClose 上 → 走 Detached → Closed，到此为止
         mod(fd, interest | Read)
         touch 后挂回空闲 LRU
 ```
+
+`depth`、LRU、poller 注册都**只在 loop 线程上改**——初稿允许 `resume` 直接
+`mod(fd)`，与 R2「所有 syscall 在 loop 上」直接冲突，第二轮评审纠出。
+`Pause` 本身只能在串行域内调用（天然在 loop 上），可以直接改。
 
 `AsyncDo` 在这之上多加两条：**同一连接同时只允许一个在途任务**（第二次调用返回
 `ErrAsyncBusy`），且 **goroutine 在当次回调返回之后才启动**。这两条加上「`resume`
@@ -503,17 +555,18 @@ resume():
 | --- | --- |
 | 读缓冲 `rbuf` | 64KB |
 | 事件数组 | 几 KB |
-| iovec / header 暂存 | 几 KB |
+| iovec 暂存 | 几 KB（帧头不在这里——它内联在 chunk 里，见 [03](03-outbound.md#stage-2待发送链)） |
 | zstd 编码器 | 0.27MB（Fastest）~ 4.27MB（Better），见 [01](01-server-api.md#压缩的内存) |
-| slab：`chunk` 节点、残片缓冲、`[]sendMsg` 队列 | 随在途量，不随连接数 |
-| `slots []slot` | 8 字节 × 最大 fd 号 |
+| slab：`chunk` 节点、残片缓冲、`[]stage1Item` 队列 | 随在途量，不随连接数 |
+| `slots []slot` | 16 字节 × 槽容量（loop 内稠密 freelist 下标，不按 fd） |
 
 ### 每连接
 
 | 项 | 量级 | 备注 |
 | --- | --- | --- |
 | `Conn` + 内联的 `State` | 与 `S` 有关 | **不池化**，每条连接一次分配 |
-| 读残片 | 稳态 **0** | 只有半个帧时才占 |
+| 读残片 `carry` | 稳态 **0** | 上界 = rbuf 容量（64KB）；大帧不进 carry |
+| 大帧目标缓冲 `frameBuf` | 稳态 **0** | 仅大帧在途时占用，上界 `MaxMessage` |
 | 出站队列 | 稳态 **0** | 按在途量付费 |
 | 内核 socket 缓冲 | **几十 KB ~ 几百 KB** | 由 `Socket.RecvBuffer` / `SendBuffer` 决定 |
 | WebSocket 握手信息 | 见 [05](05-websocket.md) | 握手完成后立刻释放握手期的临时状态 |
@@ -536,6 +589,7 @@ resume():
 | --- | --- | --- |
 | 就绪通知 | `epoll_wait`，**水平触发** | `kevent`，默认水平触发 |
 | 读写兴趣 | 一个 event 的两个位 | 两个独立 filter，分别增删 |
+| 事件合并 | 读写天然在同一个 event 里 | 同一 fd 返回两个事件，`wait` 内按 token 聚合，保证先写后读 |
 | 唤醒 | `eventfd` | `EVFILT_USER` + `NOTE_TRIGGER` |
 | 定时 | `epoll_wait` 的 ms timeout | `kevent` 的 `timespec` |
 | accept 分发 | `SO_REUSEPORT`，每 loop 一个 listener | 单 listener + 轮转投递 |
@@ -557,15 +611,18 @@ resume():
 | R2 | 所有系统调用（read / writev / poller ctl / close）都在该连接所属的 loop 线程上 |
 | R3 | 跨 goroutine 路径只做「入队 / 标脏 / 塞闭包」，**永不触碰 fd** |
 | R4 | `close(fd)` 只发生在一轮迭代的回收阶段，此时其余阶段已全部跑完 |
-| R5 | 事件里的 `token` 必须校验 generation；对不上就丢弃 |
+| R5 | 事件里的 `token` 必须校验 generation；`Post` 闭包执行前**同时**校验 generation 与主状态 |
 | R6 | `Conn.ID()` 进程内唯一且永不复用；`*Conn` 对象也永不复用 |
 | R7 | 每 loop 至多一次 `notify` 在途（`armed` 标志），先清标志再 drain |
 | R8 | 读缓冲每 loop 一块；连接级只保留「不足一帧」的残片，稳态为空 |
 | R9 | 只有出站积压非空的连接在写兴趣集合里 |
 | R10 | 只有一个时间源：`wait` 的 timeout。不使用 `timerfd` / `EVFILT_TIMER` |
-| R11 | 每轮 accept 有上限；`EMFILE` 走预留 fd 路径并临时摘掉 listener 读兴趣 |
-| R12 | 回收分两步：拆 socket 立刻做，`OnClose` 可以等 `resume`。二者之间连接资源已全部归还 |
+| R11 | 每轮 accept 有上限；`EMFILE` / `ENFILE` / `ENOBUFS` / `ENOMEM` 走预留 fd 路径 + 指数退避 |
+| R12 | 回收分两步：拆 socket（`Draining → Detached`）立刻做，`OnClose` 可以等 `resume`。二者之间连接资源已全部归还 |
 | R13 | 暂停期间 `Post` 的闭包排队不执行；`resume` 时按投递顺序放出 |
+| R14 | kqueue 下同一 fd 的读写事件按 token 聚合成一个 event，处理顺序先写后读 |
+| R15 | `Draining` 的连接只在可写事件或 `CloseLinger` 到期时动，绝不逐轮重试 |
+| R16 | `resume` 经控制项回 loop 执行；`depth` / LRU / poller 注册只在 loop 线程上改 |
 
 ---
 
@@ -614,7 +671,8 @@ loop 前缀生成。两者混用就会出现「注册表 key 撞车」。
 ### R-D5. 只用一个时间源
 
 `wait` 的 timeout 参数就是全部。不用 `timerfd` / `EVFILT_TIMER`：少一个 fd、
-少一处平台差异、少一类故障模式。四类超时共用一套侵入式 LRU，取最近的截止时刻。
+少一处平台差异、少一类故障模式。五条独立的侵入式 LRU + 一个 backoff 时刻，
+取最近的截止时刻。
 
 ### R-D6. `EMFILE` 走预留 fd 路径
 
@@ -631,3 +689,15 @@ Darwin 没有内核级 accept 负载均衡。与其在 `Options` 上开一个在
 
 macOS 的定位是开发与测试平台，单 acceptor 的额外成本（每条新连接一次跨 loop 投递）
 在这个定位下无关紧要。
+
+### R-D8. 第二轮评审驱动的四个结构修正
+
+| 初稿 | 修正 | 为什么初稿是错的 |
+| --- | --- | --- |
+| 槽位按 fd 直接索引 | 每 loop 稠密 freelist 下标 | fd 只在进程内稠密，不在单个 loop 内稠密 |
+| `StallTimeout` 复用写兴趣集合 | 按 `lastProgress` 的独立 LRU | 写兴趣集合没有时间序，扫描停不下来 |
+| `CloseLinger` 在 reap 链上逐轮重试写 | 事件驱动的 linger 链 | 对满缓冲 fd 逐轮撞 `EAGAIN` 是 syscall 风暴 |
+| `resume` 直接 `mod(fd)` | once + 控制项投递回 loop | 违反 R2（所有 syscall 在 loop 线程上） |
+
+四条的共性：**初稿都想「复用现成结构省一条链」，而复用的结构缺少所需的性质**
+（时间序、线程归属、密度）。这类省结构的诱惑要用不变式表来挡。

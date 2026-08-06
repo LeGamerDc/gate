@@ -142,7 +142,7 @@ func (c *Conn[S]) Pause() (resume func())    // 低级原语：只暂停，不�
 
 // 其它
 func (c *Conn[S]) Close(reason error)        // reason 会原样传给 OnClose
-func (c *Conn[S]) SetCipher(Cipher)          // **只能在事件循环上调用**
+func (c *Conn[S]) SetCipher(Cipher)          // **只能在串行域内调用**；出站经队列 barrier 生效
 func (c *Conn[S]) Handshake() *Handshake     // 非 WebSocket 返回 nil
 func (c *Conn[S]) Remote() netip.AddrPort
 func (c *Conn[S]) ID() uint64                // 进程内唯一且永不复用
@@ -150,7 +150,7 @@ func (c *Conn[S]) ID() uint64                // 进程内唯一且永不复用
 // ── 预编码帧：一份数据发给 N 条连接 ──────────────────────────────
 type Frame struct{ /* opaque, immutable, GC 管理 */ }
 func (s *Server[S]) NewFrame(payload []byte, opts ...FrameOption) (*Frame, error)
-func PreEncrypted() FrameOption // payload 已由业务加密（房间级共享密钥场景）
+func PreEncrypted() FrameOption // payload 是业务自理的密文：gate 跳过压缩，不设线路 e 位
 
 // ── 配置 ─────────────────────────────────────────────────────────
 type Options[S any] struct {
@@ -181,7 +181,7 @@ type Limits struct {
 	MaxMessage       int           // 单条入站消息上限
 	MaxPending       int           // Pause 期间已读出但未投递的字节上限
 	MaxConns         int           // 每 server 并发连接上限
-	MaxOutboundBytes int           // 每 server 出站积压总预算（跨全部连接）
+	MaxOutboundBytes int           // 每 server 出站积压总预算（跨全部连接；近似口径见 06）
 	MaxHandshaking   int           // 处于握手阶段的连接上限（WebSocket / PROXY）
 	HandshakeTimeout time.Duration // 握手必须在这么久内完成
 	MaxPause         time.Duration // 单次 Pause 的最长时长，超过即关闭
@@ -211,8 +211,8 @@ func RejectUpgrade(status int, reason string) error
 // ── 其它 ─────────────────────────────────────────────────────────
 type Cipher interface {
 	Overhead() int
-	Seal(dst, plaintext []byte) []byte
-	Open(dst, ciphertext []byte) ([]byte, error)
+	Seal(dst, plaintext, aad []byte) []byte          // aad = 该帧最终的 2/4 字节帧头
+	Open(dst, ciphertext, aad []byte) ([]byte, error)
 }
 
 type Field = zap.Field                  // 类型别名，零成本
@@ -400,7 +400,9 @@ c.SendFunc(n, fill)   // 业务直接写进 gate 的出站缓冲，零复制
 - **真正并发的调用之间顺序未定义**，但每个调用各自是原子的（不会有两条消息交错成
   半条）。需要顺序的业务自己建立 happens-before。
 - `Close` 与 `SetCipher` 参与同一个顺序：`SetCipher` 之前入队的消息用旧密钥，
-  之后的用新密钥——这也是它必须在事件循环上调用的原因之一。
+  之后的用新密钥——这由出站队列里的 **cipher barrier** 保证（加密发生在 flush，
+  「在哪个线程调用」本身创造不了这个边界），见 [Cipher](#cipher) 与
+  [03](03-outbound.md#setcipher队列里的-barrier)。
 
 ### `SendFunc`：零复制路径
 
@@ -410,8 +412,24 @@ err := c.SendFunc(m.SizeVT(), func(b []byte) (int, error) {
 })
 ```
 
-`fill` 拿到一块长度为 `n` 的缓冲，返回实际写入的字节数。`fill` 返回后缓冲立即入队，
-gate 全程持有所有权。
+`fill` 拿到一块长度为 `n` 的缓冲，返回实际写入的字节数。gate 全程持有所有权。
+内部是三阶段协议（完整规格见 [06](06-connection-state-machine.md#sendfunc-的两阶段协议)）：
+
+1. **reserve**：加锁检查状态与预算、扣减、取池内存——这**不是**线性化点，消息还没入队；
+2. **fill**：在锁外调用业务的 `fill`——持锁跑业务代码会把所有 `Send` / `Close`
+   挡在锁上，`fill` 里重入 `Send` 还会死锁；
+3. **commit**：重新加锁。若 `fill` 期间连接已关闭，归还内存、退还预算、返回
+   `ErrConnClosed`（消息**未**入队）；否则此刻才真正入队、线性化。
+
+`fill` 的每种返回都定死：
+
+| `fill` | 结果 |
+| --- | --- |
+| `(k, nil)`，`0 <= k <= n` | 提交前 `k` 字节 |
+| `k < 0` 或 `k > n` | 业务 bug：不入队，返回 `ErrInvalidLength` |
+| `(_, err)` | 不入队，原样返回该 error |
+| panic | 恢复屏障接住，缓冲照常回收，按 `OnMessage` panic 处理 |
+| 永不返回 | gate 不介入；`Close` **不等待** `fill`，这块预留等同业务自己的泄漏 |
 
 设计成回调而不是 `Reserve` / `Commit` 一对方法，是为了让下面这些误用**在结构上不可能**：
 
@@ -459,6 +477,7 @@ gate 全程持有所有权。
 | `ErrConnClosed` | 连接已关闭 | 停止推送，清理会话 |
 | `ErrSendQueueFull` | 积压达到 `Outbound.MaxBuffer` | 丢弃非关键推送，或提前用 `Writable()` 判断 |
 | `ErrMessageTooLarge` | 超过协议上限 32MB | 业务 bug |
+| `ErrInvalidLength` | `SendFunc` 的 `fill` 返回越界长度（`k < 0` 或 `k > n`） | 业务 bug |
 | `ErrAsyncBusy` | 该连接已有一次 `AsyncDo` 在途 | 见[阻塞任务](#这个保证是怎么来的) |
 | `ErrCipherConflict` | 对一条配了 `Cipher` 的连接调用 `SendFrame` | 见 [Frame](#frame预编码帧与广播) |
 
@@ -507,7 +526,14 @@ per-connection 独立密钥和「编码一次分发多次」在根本上不兼�
 - 对一条设置了 `Cipher` 的连接调用 `SendFrame` 返回 `ErrCipherConflict`——**显式失败，
   不静默降级成明文**。
 - 房间级共享密钥的场景：业务自己加密 payload，然后
-  `srv.NewFrame(sealed, gate.PreEncrypted())`，gate 只负责打标记位。
+  `srv.NewFrame(sealed, gate.PreEncrypted())`。
+
+**`PreEncrypted` 不复用线路的 `e` 位。** 它只声明「payload 已是密文」，效果是 gate
+跳过压缩（压密文只浪费 CPU）；解密由对端**业务**完成，gate 视 payload 为不透明字节。
+初稿让它设置 `e` 位——但 `e` 位属于连接级 `Cipher` 的职权：配了 Cipher 的对端会用
+**连接**密钥去 `Open` 一个用**房间**密钥封的帧（必然失败），没配 Cipher 的对端按
+[02 的 W3](02-wire-protocol.md#w3-cipher-配置与-e-位强制一致) 根本不接受 `e = 1`。
+两头都走不通，所以业务自理的加密必须整体待在 payload 里，不碰 gate 的标记位。
 
 ---
 
@@ -614,7 +640,7 @@ gate 无从知道它何时开始。在其中访问 `State` 是一个 `-race` 才
 | `OnMessage` 返回 error | 是 | **是**，`reason` = 该 error | |
 | `OnMessage` panic | 是 | **是**，`reason` = `ErrHandlerPanic` | |
 | `Post` 的函数体 panic | 是 | **是**，`ErrHandlerPanic` | |
-| `AsyncDo` 的函数体 panic | 是 | 视连接状态而定 | 记日志，暂停照常归还；若连接已在等这次归还，则此时才触发 `OnClose` |
+| `AsyncDo` 的函数体 panic | 是 | **是**，`reason` = `ErrHandlerPanic` | 恢复屏障接住，归还暂停令牌，连接关闭——与 `Post` panic 同一策略：`State` 可能改到一半，这条连接不能再要了 |
 | `OnClose` panic | 是 | 已在其中 | 记日志，清理继续 |
 
 一句话：**`OnClose` 只与成功返回的 `OnOpen` 配对。** 业务因此不必写「我到底初始化到
@@ -638,7 +664,11 @@ Outbound{
 
 加上一条全局的：`Limits.MaxOutboundBytes` 约束**整个 server 所有连接**的出站积压总和。
 只有每连接上限是不够的——`2MB × 10 万连接 = 200GB`，分布式慢客户端不需要让任何一条
-连接越线就能拖垮进程。
+连接越线就能拖垮进程。它的默认值是**有限**的（1GB），要放开必须显式写
+`gate.Unlimited`——保护性选项的零值是默认值，这条原则对它同样适用（初稿写
+「默认不限」，恰好违反了自己定的原则）。它的口径是**近似**的：为了不让一条全局
+cache line 被所有发送核心争抢，预算按 loop 租约划拨，瞬时总量可能超出一个租约粒度，
+见 [06 的预算模型](06-connection-state-machine.md#预算模型)。
 
 **准入上限不关连接。** `Send` 返回 `ErrSendQueueFull` 时消息**从未进入队列**，
 帧流上没有洞，业务知道是**哪一条**没发出去。这比上一版好：上一版是在 flush 时发现
@@ -651,6 +681,11 @@ Outbound{
 一条长期贴着上限但在稳定排空的连接是健康的（`ErrSendQueueFull` 已经在提醒业务了）；
 一条一个字节都写不出去的连接是死的。`Limits.Idle` 救不了它——空闲判据是「交付过完整
 消息」，而一个卡死的对端确实不再发消息。
+
+`StallTimeout` 只抓「零进度」，有一个已知盲区：每 29 秒读走 1 字节的对端可以永久
+重置计时，同时占着 `MaxBuffer`。完整保护需要「最老消息年龄」类判据，v1 不加第三个
+旋钮，把盲区写明，总代价由 `MaxOutboundBytes` 兜底——见
+[03](03-outbound.md#为什么需要-stalltimeout)。
 
 `Writable()` 让业务可以**主动降级**而不是被动断线：
 
@@ -691,8 +726,9 @@ func (h *handler) pushWorldState(c *gate.Conn[*player], snap []byte) {
 「读进来先存着」的原因——后者等于在用户态重新实现内核已经做好的事，而且要为此
 再发明一个积压上限。
 
-**发方向占满才是需要处理的。** gate 从不阻塞在 `write` 上，也从不从队列中间丢消息，
-只有两条水位线：软的让业务降级，硬的关连接。
+**发方向占满才是需要处理的。** gate 从不阻塞在 `write` 上，也从不从队列中间丢消息。
+三道防线各司其职：软水位让业务降级（`Writable()`），准入线让 `Send` 明确报错
+（消息未入队，连接照常活着），**只有卡死检测才关连接**（`StallTimeout`）。
 
 两个实操要点：
 
@@ -807,8 +843,8 @@ func (c *Conn[S]) Post(f func(*Conn[S]))
   上限由 `Limits.MaxPending` 约束。
 - 可重入：多次 `Pause` 需要同样多次 `resume` 才恢复。
 - `resume` 幂等；在已关闭的连接上调用是 no-op。
-- 只应在 `OnMessage` 内 `Pause`。从别的 goroutine 调用时「单连接内串行」的保证
-  不成立——事件循环可能已经越过了暂停检查。
+- `Pause` 只能在**串行域内**调用（与速查表一致）。从别的 goroutine 调用时
+  「单连接内串行」的保证不成立——事件循环可能已经越过了暂停检查。
 - **暂停期间不计入 `Limits.Idle` 的空闲时长**，`resume` 之后重新开始计时。
   否则一个跑 6 分钟 RPC 的 `AsyncDo` 会被 5 分钟的空闲判定干掉。
 - **但暂停本身有上限**：单次暂停超过 `Limits.MaxPause` 即关闭连接
@@ -864,7 +900,7 @@ func (c *Conn[S]) Post(f func(*Conn[S]))
 | 项 | 量级 | 备注 |
 | --- | --- | --- |
 | 连接对象 + `State S` | 与 `S` 有关 | 值类型 `S` 内联，不额外分配 |
-| 未投递完的入站残片 | 稳态 **0** | 只有半个帧时才占；上界 `Limits.MaxPending` |
+| 未投递完的入站残片 | 稳态 **0** | carry ≤ 64KB；大帧缓冲 ≤ `MaxMessage`；`Pause` 时整体受 `Limits.MaxPending` 封顶 |
 | 出站队列 | 稳态 **0** | 按在途量付费，上界 `Outbound.MaxBuffer` |
 | 内核 socket 缓冲 | **几十 KB ~ 几百 KB** | 由 `Socket.RecvBuffer` / `SendBuffer` 决定 |
 | `Cipher` 实现的状态 | 取决于实现 | 见下 |
@@ -968,7 +1004,7 @@ data race。同理 `DefaultOutbound()` 是**函数**而不是可变的包级变�
 | `MaxMessage` | 32MB（协议上限） | 单条入站消息上限。**值得按业务收紧**，它决定单条连接能让服务端缓冲多少数据 |
 | `MaxPending` | `MaxMessage + 64KB` | `Pause` 期间「已从内核读出、尚未投递」的字节上限 |
 | `MaxConns` | 不限 | 超过后新连接立即关闭（`ErrConnLimit`），`OnOpen` 不会被调用 |
-| `MaxOutboundBytes` | **不限** | 整个 server 所有连接的出站积压总预算 |
+| `MaxOutboundBytes` | **1GB** | 整个 server 所有连接的出站积压总预算；近似口径（loop 配额租约，见 06）；`gate.Unlimited` 关闭 |
 | `MaxHandshaking` | `MaxConns / 16` | 处于握手阶段（WebSocket / PROXY）的连接上限 |
 | `HandshakeTimeout` | **10s** | 握手必须在这么久内完成，否则关闭（`ErrHandshakeTimeout`） |
 | `MaxPause` | **60s** | 单次 `Pause` 的最长时长，超过即关闭（`ErrPauseTimeout`） |
@@ -1117,11 +1153,11 @@ c.Close(errKickedByAdmin)
 ```go
 type Cipher interface {
 	Overhead() int
-	Seal(dst, plaintext []byte) []byte
-	Open(dst, ciphertext []byte) ([]byte, error)
+	Seal(dst, plaintext, aad []byte) []byte
+	Open(dst, ciphertext, aad []byte) ([]byte, error)
 }
 
-c.SetCipher(myCipher)  // 只能在事件循环上调用；nil 表示关闭加密
+c.SetCipher(myCipher)  // 只能在串行域内调用；nil 表示关闭加密
 ```
 
 ### 契约
@@ -1133,6 +1169,7 @@ c.SetCipher(myCipher)  // 只能在事件循环上调用；nil 表示关闭加�
 | `Overhead()` | 常量，不随调用变化。`0` 表示长度保持 |
 | `Seal` 返回长度 | **恰好** `len(plaintext) + Overhead()`。少一个字节帧头就写错了 |
 | `Open` 返回长度 | `<= len(ciphertext) - Overhead()`；认证失败返回 error |
+| `aad` | gate 传入**该帧最终的 2/4 字节帧头**。AEAD 实现必须把它纳入认证（照 `crypto/cipher.AEAD` 的语义）；`Overhead() == 0` 的实现可以忽略它，代价是得不到帧头认证 |
 | `dst` | gate 保证容量足够。`Overhead() == 0` 时 gate 传 `dst = src[:0]`，允许**原地**覆写 |
 | aliasing | 除上面那种原地情形外，`dst` 与 `src` 不重叠 |
 | nonce | **收发必须使用各自独立的序列**，见下 |
@@ -1161,18 +1198,20 @@ frameSize(len(data) + Overhead()) <= Limits.MaxMessage
 也就是说一条贴着 `MaxMessage` 的明文消息在配了 AEAD 之后会被 `Send` 拒绝
 （`ErrMessageTooLarge`），而不是编码到一半才发现越限。
 
-### `SetCipher` 为什么只能在事件循环上调用
+### `SetCipher`：串行域内调用，出站经队列 barrier 生效
 
 密钥切换必须**在帧流里有一个确定的位置**——切换点之前的帧用旧密钥，之后的用新密钥，
-否则对端无从解密。
+否则对端无从解密。它一次做两件事：
 
-而加密发生在 **flush 时**，不是入队时。一个从别的 goroutine 发起的原子指针替换，
-和一次正在进行的 flush 之间没有任何顺序关系：同一批消息可能一半用旧密钥、一半用新的。
+- **入站**：cipher 是只在串行域内读写的普通字段，切换对下一个被解析的帧生效。
+  这就是「只能在串行域内调用」（回调、`Post`、`AsyncDo` 的函数体）的原因，
+  顺带消掉一个原子指针。
+- **出站**：往出站队列追加一个 **cipher barrier**。加密发生在 **flush 时**，不是
+  入队时——初稿以为「在事件循环上调用」就足够了，但已入队未编码的消息照样会被
+  新密钥追上（第二轮评审的 P0）。编码器遇到 barrier 才切换，并结束当前的 compound
+  分组。见 [03](03-outbound.md#setcipher队列里的-barrier)。
 
-要求它在事件循环上调用（回调内，或 `Post` 里），切换点就落在两次 flush 之间，
-位置是确定的。顺带消掉一个原子指针——它变成一个只被单线程访问的普通字段。
-
-异步握手完成后换密钥的典型写法：
+异步握手完成后换密钥的典型写法（`AsyncDo` 的函数体在串行域内，也可以直接调）：
 
 ```go
 c.Post(func(c *gate.Conn[*player]) {
@@ -1203,27 +1242,22 @@ c.Post(func(c *gate.Conn[*player]) {
 代价：同一批里 panic 之前已经处理的消息**已经投递给业务了**，之后的不会。
 这与 `OnMessage` 返回 error 时的行为一致，业务不需要理解第二套语义。
 
-### 关于帧头未被认证
+### 帧头在认证范围内（AAD）
 
-帧头（长度 + `m`/`z`/`c`/`e`）**不在** AEAD 的认证范围内。逐位的后果分析、
-以及为什么只有 `e` 位翻转需要额外处理（gate 用「配了 Cipher 就要求每帧 `e = 1`」
-这一条堵死），见 [02 的降级攻击一节](02-wire-protocol.md#降级攻击清掉-e-位)。
+`aad` 参数就是**该帧最终的帧头**（长度 + `m`/`z`/`c`/`e`）。任何被中间人翻过标记位
+或长度的帧在 `Open` 时认证失败——堵住的是 `z`/`c`/`e` **清位**那一类静默误解释
+（逐位、逐方向的分析见 [02 的降级攻击一节](02-wire-protocol.md#降级攻击翻转标记位)）。
+「配了 Cipher 就要求每帧 `e = 1`」的检查仍然保留：AAD 只保护走进 `Open` 的帧，
+`e` 被清成 0 的帧根本不解密，必须由这条规则逼进认证路径。
 
 一句话定位：**gate 的 `Cipher` 是防嗅探、防外挂的纵深防御，不是用来对抗主动中间人的**
-——那是 TLS 的职责，而 gate 明确要求前置 TLS 终结。
+——那是 TLS 的职责，而 gate 明确要求前置 TLS 终结。AAD 只是让「一次位翻转导致
+静默误解释」在这道纵深防御里也不成立。
 
 > **为什么要改掉 `Encrypt([]byte)` / `Decrypt([]byte)`。** 原地、不改长度、无返回值的
 > 形状排除了所有 AEAD——而游戏网关要做防篡改迟早会撞上。更重要的是 `Decrypt`
 > 没有错误通道：认证失败是**正常的协议错误**，不该只能靠 panic 表达。
 > 现在 `Open` 返回 error，连接以 `ErrProtocol` 关闭，业务在 `OnClose` 里就能看到。
-
-`Seal` / `Open` 在入站解密和出站加密的热路径上被逐帧调用，**不加恢复屏障**——
-每帧一次 `defer recover()` 的代价不值得。因此 `Cipher` 的实现必须保证不 panic。
-这是整个 API 里唯一一条「你必须遵守否则进程会死」的约定，写在这里而不是藏在注释里。
-
-`SetCipher` 最典型的用法是异步握手完成后换密钥（也就是从 `AsyncDo` 的 goroutine 里调），
-所以它必须是并发安全的。gate 保证：切换在**帧边界**生效，同一批消息里换了密钥，
-后续帧立刻用新密钥解，不会出现「用旧密钥解新帧」。
 
 ---
 
@@ -1265,8 +1299,9 @@ WebSocket: &gate.WebSocketOptions{
 ### 本地主动关闭会发送 close 帧
 
 `Close(reason)`、空闲回收、`Shutdown` 这些**正常关闭**会先发一个 WebSocket close 帧
-再关 TCP，对端因此能拿到一个状态码而不是 1006（abnormal closure）。协议错误和背压
-关闭则直接关 TCP——那时帧流本来就已经不可信或者根本写不出去。
+再关 TCP，对端因此能拿到一个状态码而不是 1006（abnormal closure）。**协议错误也发**
+（1002——坏的是入站方向，出站还能写）；只有背压和写失败直接关 TCP，
+那时出站方向根本写不动或已经有洞。
 
 具体的 reason → close code 映射见 [05-websocket](05-websocket.md#关闭语义)。
 
@@ -1715,6 +1750,9 @@ loop」，也就是被放弃的第一版。gate 能做得更进一步，是因�
 同时确立一条零值原则：**性能选项的零值是关闭，保护性选项的零值是默认值**，
 要关掉必须显式写 `gate.Unlimited`。忘了配压缩只是慢一点，忘了配出站上限是 OOM。
 
+复核后把这条原则贯彻到 `MaxOutboundBytes` 自己头上：初稿给它的默认值是「不限」，
+恰好违反本条——现改为有限默认（1GB），并明确其近似口径（loop 配额租约，见 06）。
+
 ### D23. 补齐三个「无人管辖」的时间窗口
 
 每一个都是「连接存在，但现有的回收机制都管不到它」：
@@ -1726,6 +1764,29 @@ loop」，也就是被放弃的第一版。gate 能做得更进一步，是因�
 | 出站卡死 | 对端不发消息也算「没超时」，`Idle` 不认 | `StallTimeout` |
 
 三者都搭在 reactor 已有的每轮超时扫描上，不引入新的时间源。
+
+### D24. `Cipher` 带上 AAD——推翻初版的「不做 AAD」论证
+
+初版拒绝 AAD 的两条理由（长度循环依赖、4 个 bit 不值一个参数）都被第二轮评审推翻：
+`Overhead()` 是常量、`Seal` 长度精确，先算长度拼头再 seal 即可，不存在循环依赖；
+而初版的翻位分析漏了 `1→0` 方向——`z`/`c` 清位在下行方向是**静默**的，
+「其余翻转都可检测」这个前提本身就错了。完整分析见
+[02 的 W9](02-wire-protocol.md#w9-完整帧头进入-aead-认证范围aad)。
+`aad` = 该帧最终帧头，由 gate 生成并传入；实现照 `crypto/cipher.AEAD` 语义处理。
+
+### D25. `SetCipher` 的出站生效点是队列 barrier
+
+「只能在事件循环上调用」是必要条件，不是充分条件：加密发生在 flush，已入队未编码
+的消息会被新密钥追上。出站生效点必须表达为**队列里的 barrier**（编码器遇到才切换、
+并结束当前 compound 分组）；入站则是串行域字段的即时切换。调用约束从「事件循环上」
+精确化为「串行域内」——`AsyncDo` 的函数体也是合法调用点（它属于串行域，见 D18）。
+
+### D26. `PreEncrypted` 不复用线路 `e` 位
+
+`e` 位属于**连接级** Cipher 的职权。共享帧若带 `e = 1`：配了 Cipher 的对端会用连接
+密钥去解房间密钥封的帧（必然失败），没配的对端按 02 的 W3 直接拒收——两头都走不通。
+所以 `PreEncrypted` 重定义为「payload 是业务自理的密文」：gate 只跳过压缩、
+不碰标记位，解密由对端业务完成。见 [Frame 的与加密的关系](#与加密的关系)。
 
 
 ---
@@ -1788,7 +1849,7 @@ gate 的传输层只有 TCP 和 WS 两种、编解码只有一种，为这点灵
 | `DefaultSenderBuilder` | `DefaultOutbound()` |
 | `Conn.SendNoEncrypt`（明文旁路） | `Conn.SendAlone`（**仍然加密**，见 D21） |
 | `Conn.SendStatic(data, compressed)` | `srv.NewFrame(data)` + `Conn.SendFrame`（GC 管理，无需释放） |
-| `Conn.UpdateCipher`（任意 goroutine） | `Conn.SetCipher`（**只能在事件循环上**，见 D-Cipher） |
+| `Conn.UpdateCipher`（任意 goroutine） | `Conn.SetCipher`（**只能在串行域内**；出站经队列 barrier 生效，见 D25） |
 | `Conn.AsyncDo`（重入、并发语义未定义） | 保留并收紧：**拒绝重入**、回调返回后才启动、`OnClose` 推迟到 `resume` 之后 ⇒ 函数体属于串行域，**可以直接访问 `State`**（D18）。裸暂停另开 `Conn.Pause()`，不带此保证 |
 | `Conn.Close()` | `Conn.Close(reason)` |
 | `Conn.RemoteIp/RemotePort/Remote` | `Conn.Remote() netip.AddrPort` |
@@ -1797,7 +1858,7 @@ gate 的传输层只有 TCP 和 WS 两种、编解码只有一种，为这点灵
 | `Config.MaxConnections/IdleTimeout/TCPKeepAlive` | `Limits.MaxConns/Idle/KeepAlive` |
 | `Config.Logger`（gnet 类型，printf 风格，进程级全局） | `Options.Log`（zap 形状，`*zap.Logger` 直接可用，每 server 一份） |
 | `ws.RejectConnectionError(...)` | `gate.RejectUpgrade(status, reason)` |
-| `Cipher.Encrypt/Decrypt` | `Cipher.Seal/Open` + `Overhead()` |
+| `Cipher.Encrypt/Decrypt` | `Cipher.Seal/Open`（带 `aad` = 帧头）+ `Overhead()`，见 D24 |
 | `StartServer` / `StartEventLoop` / `StartWebSocketServer` | `Listen` / `Run` |
 | `Server.Stop(ctx)` | `Server.Shutdown(ctx)` |
 | —— | 新增：`Conn.Post()`、`Conn.Writable()`、`Conn.ID()`、`Conn.SendFunc()`、`Server.Stats()/LoopStats()`、`Socket`、`Options.Proxy`、`Outbound.Dict/StallTimeout/CloseLinger`、`Limits.MaxOutboundBytes/MaxHandshaking/HandshakeTimeout/MaxPause` |

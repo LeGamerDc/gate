@@ -111,10 +111,14 @@ const _ = uint(maxHeaderLen - 1 - maxMessageSize)
 
 ### 扩展空间
 
-强制规范编码之后，`m = 1 && 高12 == 0 && 低16 < 4096` 这段编码变成**不可达**，
-共 4096 个取值。它是**唯一预留的扩展点**：将来需要版本号、新标记位或新帧类型时，
-从这里开辟，老实现会把它当协议违规拒掉——这正是我们要的行为（明确失败，不是
-静默误解）。
+强制规范编码之后，`m = 1 && 高12 == 0 && 低16 < 4096` 这段编码变成**不可达**：
+长度码 4096 个，连同 `z`/`c`/`e` 的 8 种组合，不可达的线路位型共 **32768** 个。
+它是**唯一预留的扩展点**：将来需要版本号、新标记位或新帧类型时从这里开辟，
+老实现会把它当协议违规拒掉——这正是我们要的行为（明确失败，不是静默误解）。
+
+启用这段编码时，这些位**不再表达原义**（`z`/`c`/`e` 与低 16 位都腾出来了），
+必须显式定义成新的扩展头布局——「逃逸码 + 版本 + 类型 + 新长度」——而不是
+把旧字段的语义偷偷续用。
 
 除此之外，帧头里**没有任何保留位**：4 个标记位全部用满，12 位长度也全部用满。
 这是刻意的取舍——2 字节头的价值就来自这种紧凑，留保留位就要么牺牲长度范围，
@@ -256,7 +260,10 @@ compound payload = Σ ( 子帧头 + 子 payload )
 5. 规范编码：m = 1 且 size < 4096    → 协议违规
 6. size > codec.maxMessage           → 协议违规      ← 必须早于任何按长度切片/分配
 7. 标记位不在 allow 之内             → 协议违规
-8. 配了 Cipher 但 e = 0              → 协议违规      ← 见「降级攻击」
+8. Cipher 配置与 e 位不一致          → 协议违规      ← 见「降级攻击」
+   （配了 Cipher 但 e = 0 ⇒ ErrCipherRequired；
+     没配 Cipher 但 e = 1 ⇒ ErrCipherUnavailable——
+     漏掉后一半会走进一个 Open 为 nil 的路径）
 9. 可读字节 < header + size          → 数据不足，等待（可重试）
 10. 切出 payload（三索引切片封住 cap）
 ────────── 以上为 parse，以下为 deliver ──────────
@@ -301,31 +308,40 @@ compound payload = Σ ( 子帧头 + 子 payload )
 编译期断言 + 发送侧在写头之前再判一次。任何越界都宁可关连接，也不能写一个
 「长度和标记同时错、两端都察觉不到」的帧上线路。
 
-### 降级攻击：清掉 `e` 位
+### 降级攻击：翻转标记位
 
-帧头**不在**加密的认证范围内（AEAD 的 AAD 里没有它），所以一个能改字节的中间人
-可以翻转标记位。逐位分析后果：
+一个能改字节的中间人可以翻转帧头的标记位。逐位、**逐方向**分析后果
+（初版只分析了 `0→1` 方向，是第二轮评审纠出来的错——静默的恰恰在 `1→0` 那一半）：
 
-| 翻转 | 后果 |
-| --- | --- |
-| `z` 0→1 | 接收方尝试解压明文 → zstd 失败 → 关连接。**可检测** |
-| `c` 0→1 | 接收方尝试切分 → 几乎必然切不干净 → 关连接。**可检测** |
-| `m`、长度 | 帧边界错位 → 后续解析失败 → 关连接。**可检测** |
-| **`e` 1→0** | 接收方**不解密**，把密文当明文原样交给业务层。**这是唯一一个静默的** |
+| 翻转 | 后果 | 静默？ |
+| --- | --- | --- |
+| `z` 0→1 | 解压明文失败 → 关连接 | 否 |
+| **`z` 1→0** | **不解压，把压缩字节当业务明文投递** | **是** |
+| `c` 0→1 | 切分失败 → 关连接 | 否 |
+| **`c` 1→0** | **不切分，把整个 compound body 当一条消息投递** | **是** |
+| **`e` 1→0** | **不解密，把密文当明文投递** | **是** |
+| `m`、长度 | 帧边界错位 → 后续解析失败 → 关连接 | 否 |
 
-所以校验规格第 8 步：**只要连接配置了 `Cipher`，就要求每一个入站帧都带 `e = 1`，
-否则按协议违规关闭。** 一次布尔判断，把唯一那条静默路径堵死。
+服务端上行因为 `allow = e` 恰好躲过 `z`/`c` 那两条（它们根本不允许为 1），
+但**下行方向、以及任何第三方客户端实现都中招**。所以防御是两条，缺一不可：
 
-上一版没有这条规则：`if f.e { decrypt }`，`e = 0` 的帧即使在配了 cipher 的连接上
+1. **完整帧头进入 AEAD 的认证范围（AAD）**。`Cipher.Seal / Open` 带 `aad` 参数，
+   `aad` = 该帧最终的 2 或 4 字节帧头。任何被翻过位的帧在 `Open` 时认证失败。
+   初版说「长度依赖 seal 之后的字节数，循环依赖，做不了 AAD」——**这是错的**：
+   `Overhead()` 是常量、`Seal` 输出长度精确，编码时先算最终长度、拼出帧头、
+   再把帧头当 AAD 交给 `Seal`，不存在循环。
+2. **Cipher 配置与 `e` 位强制一致**（校验规格第 8 步）。AAD 只保护**走进 `Open`**
+   的帧——`e` 被翻成 0 的帧根本不会解密，AAD 管不到它。「配了 Cipher ⇒ 每帧必须
+   `e = 1`」把所有帧都逼进认证路径；对称方向「没配 Cipher ⇒ `e` 必须为 0」堵住
+   nil cipher 解引用。
+
+上一版两条都没有：`if f.e { decrypt }`，`e = 0` 的帧即使在配了 cipher 的连接上
 也会被当明文投递。
 
-> **不把帧头放进 AAD 的理由。** 那需要 `Cipher` 接口带上 `aad` 参数，而长度字段
-> 依赖 seal 之后的字节数（循环依赖），只能把标记位单独拎出来做 AAD——为 4 个 bit
-> 增加一个接口参数、并要求所有实现正确处理它，不划算。
-> 更重要的是**定位问题**：gate 的 `Cipher` 是防嗅探/防外挂的纵深防御，
-> **不是**用来对抗主动中间人的——那是 TLS 的职责，而 gate 明确要求前置 TLS 终结
-> （见 01 的非目标）。在这个定位下，「可检测」对三种翻转已经足够，
-> 剩下那一种用一次布尔判断解决。
+> **定位不变**：gate 的 `Cipher` 是防嗅探/防外挂的纵深防御，对抗完整的主动中间人
+> 仍是 TLS 的职责（gate 明确要求前置 TLS 终结，见 01 的非目标）。AAD 的成本只是
+> 一个接口参数，换来的是把「一次位翻转导致静默误解释」这一整类关掉；顺带地，
+> 计数器 nonce 让删帧、乱序在解密时即刻失败。
 
 ### 压缩侧信道（CRIME 类）
 
@@ -358,8 +374,10 @@ gate 不自作主张地替业务判断什么是敏感数据，但把这个取舍
 
 `Cipher.Overhead() > 0` 时密文比明文长，这对帧格式有两个影响：
 
-1. **帧头写的是最终线路字节数**，也就是 seal 之后的长度。因此编码时**必须先 seal
-   再写头**，不能像长度保持的流式密码那样先占位再原地加密。
+1. **帧头写的是最终线路字节数**，也就是 seal 之后的长度。`Overhead()` 是常量、
+   `Seal` 输出长度精确，所以编码顺序是：先算最终长度 → 生成帧头 → 以帧头为 AAD
+   调 `Seal(dst, plaintext, header)`。解码侧对应地 `Open(dst, ciphertext, header)`。
+   帧头本身不加密，但**被认证**——见[降级攻击](#降级攻击翻转标记位)。
 2. **`Limits.MaxMessage` 约束的是线路长度**（我们必须缓冲的那个数）。
    `Open` 之后的明文只会更短，所以不需要第二重检查。
 
@@ -406,6 +424,7 @@ compound 的子帧头描述的是**明文**长度：compound body 在被切分�
 | `ErrNonCanonicalHeader` | `m = 1` 但 `size < 4096` |
 | `ErrFlagNotAllowed` | 标记位不在 `allow` 之内 |
 | `ErrCipherRequired` | 配了 Cipher 却收到 `e = 0` 的帧 |
+| `ErrCipherUnavailable` | 没配 Cipher 却收到 `e = 1` 的帧 |
 | `ErrDecryptFailed` | `Open` 返回错误 |
 | `ErrDecompressLimit` | 解压输出超过上限 |
 | `ErrTrailingBytes` | compound 切不干净 |
@@ -431,6 +450,7 @@ func (c codec) subCodec() codec                  // allow = 0
 
 // parse 从 src 头部定位一个完整帧，不做任何解密/解压/展开。
 // payload 借用 src 的底层数组（三索引切片），生命周期由调用方负责。
+// frame 保留原始的 2/4 字节帧头，作为 deliver 里 Open 的 aad。
 func (c codec) parse(src []byte) (f frame, n int, ok bool, err error)
 
 // deliver 完成 解密 → 解压 → 展开 的全过程，逐条交给 sink。
@@ -493,8 +513,9 @@ round-trip 断言全部通过。
 **选择。** `m = 1 ⟺ size >= 4096`，违反即协议违规。一次比较的成本。
 
 **收益（不只是消除歧义）。** 这条规则让 `m=1 && 高12==0 && 低16<4096` 变成不可达编码，
-凭空得到 4096 个取值作为**唯一的**协议扩展点。原本这份格式是没有任何保留位的
-（4 个标记位 + 12 位长度刚好占满 16 bit），加了这条规则反而有了未来。
+凭空得到一整段逃逸空间（32768 个线路位型）作为**唯一的**协议扩展点。
+原本这份格式是没有任何保留位的（4 个标记位 + 12 位长度刚好占满 16 bit），
+加了这条规则反而有了未来。
 
 ### W2. 服务端不接受上行压缩与合包
 
@@ -504,10 +525,11 @@ round-trip 断言全部通过。
 结果：服务端进程里根本不存在 zstd 解码器。这比「支持但设个上限」强得多——
 后者是靠参数防守，前者是攻击面不存在。
 
-### W3. 配了 Cipher 就要求每帧 `e = 1`
+### W3. Cipher 配置与 `e` 位强制一致
 
-见[降级攻击](#降级攻击清掉-e-位)。这是这一版新增的检查，堵掉标记位翻转里唯一那条
-**静默**路径（其余三种都会自然导致解析失败）。一次布尔判断。
+见[降级攻击](#降级攻击翻转标记位)。两个方向都查：配了 Cipher 但 `e = 0` ⇒
+`ErrCipherRequired`；没配但 `e = 1` ⇒ `ErrCipherUnavailable`。前者把所有帧逼进
+认证路径（AAD 管不到不解密的帧），后者堵住 nil cipher 路径。两次布尔判断。
 
 ### W4. 一份 codec，角色差异只体现为 allow 掩码
 
@@ -536,6 +558,18 @@ zstd 跨消息复用上下文。这是整份协议里最主要的性能价值点
 「数据不足」是唯一可重试的返回，它只可能来自 `parse`。分离让这两种语义在类型上
 不会纠缠。
 
+### W9. 完整帧头进入 AEAD 认证范围（AAD）
+
+初版明确拒绝了 AAD，理由有二：长度字段依赖 seal 后的字节数（循环依赖）；
+为 4 个标记位加一个接口参数不划算。第二轮评审推翻了两条：**循环依赖不存在**
+（`Overhead()` 是常量、`Seal` 长度精确，先算长度拼头再 seal 即可）；
+**翻位分析漏了 `1→0` 方向**，`z`/`c` 清位在下行和第三方客户端上是静默的，
+「可检测」的前提本身就错了。见[降级攻击](#降级攻击翻转标记位)。
+
+**代价。** `Cipher` 接口多一个 `aad []byte` 参数；实现照抄
+`crypto/cipher.AEAD` 的语义即可。非 AEAD（`Overhead() == 0`）实现可以忽略 `aad`，
+但那样就享受不到帧头认证——文档要写明这是实现自己的取舍。
+
 ---
 
 ## 附：编解码伪码
@@ -553,10 +587,13 @@ encode(msgs []message, cfg Outbound) → wire bytes
         if len(out) < len(data):          // 压完更大就丢掉压缩结果
             data, flag = out, flag|z
     if cipher != nil && 允许加密:
-        data = cipher.Seal(pooled, data)  // Overhead()==0 时原地
         flag |= e
-    assert len(data) <= maxMessageSize
-    header := encodeHeader(len(data)); header[0] |= flag
+        assert len(data)+Overhead() <= maxMessageSize
+        header := encodeHeader(len(data)+Overhead()); header[0] |= flag  // 先算长度拼头
+        data = cipher.Seal(pooled, data, header)                         // 帧头做 AAD
+    else:
+        assert len(data) <= maxMessageSize
+        header := encodeHeader(len(data)); header[0] |= flag
     → iovec{header, data}
 
   compound（组内 >= 2 条）：
@@ -566,9 +603,13 @@ encode(msgs []message, cfg Outbound) → wire bytes
         out := zstd.EncodeAll(body, pooled)
         if len(out) < len(body): body, flag = out, flag|z
     if cipher != nil:
-        body = cipher.Seal(pooled, body); flag |= e
-    assert len(body) <= maxMessageSize
-    header := encodeHeader(len(body)); header[0] |= flag
+        flag |= e
+        assert len(body)+Overhead() <= maxMessageSize
+        header := encodeHeader(len(body)+Overhead()); header[0] |= flag
+        body = cipher.Seal(pooled, body, header)      // 外层帧头做 AAD；子头在明文里
+    else:
+        assert len(body) <= maxMessageSize
+        header := encodeHeader(len(body)); header[0] |= flag
     → iovec{header, body}
 
 decode(src []byte, c codec) → messages
@@ -578,7 +619,7 @@ decode(src []byte, c codec) → messages
   if !ok: 保留 src，等下一次读事件
 
   data := f.payload
-  if f.e: data = cipher.Open(data)      // 失败 → 关闭连接
+  if f.e: data = cipher.Open(data, f.header)  // 帧头做 AAD；失败 → 关闭连接
   if f.z: data = decompress(data, 上限) // 失败/超限 → 关闭连接
   if f.c:
       sub := c.subCodec()               // allow = 0
