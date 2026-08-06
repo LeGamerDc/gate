@@ -1,0 +1,96 @@
+# CI 矩阵按 docs/design/07-testing.md 定义。
+#
+# macOS 在每次提交的矩阵里不是可选项：kqueue 路径（读写事件聚合、EVFILT_USER
+# 唤醒、单 acceptor 投递）只有在它上面才真正执行——那是 README 约束 2
+# 「一份语义，两种 poller」的测试面。
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 18 * * *" # 夜间长跑
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      # 第 1–5 层 + fuzz corpus 回归（种子语料随 go test 跑一遍）。
+      - name: test
+        run: go test -count=1 ./...
+
+      # 第 5 层：并发与线性化。
+      - name: race
+        run: go test -race -count=1 ./...
+
+      # 第 6 层的硬断言：0 allocs/op 回归即失败。
+      - name: zero-alloc guards
+        run: go test -count=1 -run 'TestZeroAlloc' ./...
+
+      # 交叉编译：另一平台的 poller 实现也要保持可编译。
+      - name: cross build
+        run: |
+          GOOS=linux GOARCH=amd64 go build ./...
+          GOOS=linux GOARCH=arm64 go build ./...
+          GOOS=darwin GOARCH=arm64 go build ./...
+
+  fuzz:
+    if: github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        target:
+          - FuzzCodecParse
+          - FuzzRoundTrip
+          - FuzzWebSocketFrames
+          - FuzzWSFeedSplit
+          - FuzzGateCarrySplit
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: long fuzz
+        run: go test -run '^$' -fuzz ${{ matrix.target }} -fuzztime 30m .
+      - name: upload crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.os }}-${{ matrix.target }}
+          path: testdata/fuzz/
+
+  bench:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      # 吞吐是趋势级判据（不做硬断言）：留档比对，避免 CI 抖动造成 flaky。
+      - name: throughput baseline
+        run: go test -run '^$' -bench . -benchtime 2s -count 3 . | tee bench.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench
+          path: bench.txt
