@@ -108,8 +108,17 @@ WebSocket 的封帧挂在出站的最后一跳，而三者对「谁维护残片�
 ## 实现状态
 
 本文档集对应的实现已在仓库根目录完成（按 codec → outbound → poller → loop/状态机
-→ WebSocket → server 装配 → 性能护栏的顺序，每层一个 commit）。实现期发现并回改的
-文档问题：`CloseLinger` 的零值语义（零值 = 默认 1s，`Unlimited` = 立即关闭）。
+→ WebSocket → server 装配 → 性能护栏的顺序，每层一个 commit），随后经过一轮独立
+评审并修完全部 P0/P1。
+
+实现期发现并回改进文档的问题：
+
+| 文档 | 问题 |
+| --- | --- |
+| 01 | `CloseLinger` 的零值语义自相矛盾（零值 = 默认 1s，`Unlimited` = 立即关闭） |
+| 05 | close 帧的顺序保证只写了「不插进半个帧中间」，漏了「不被后来的数据帧越过」——后者要求先置 `closing` 再追加；帧流有洞时连 close 帧也不发 |
+| 06 | 线性化点总表只写了 `Close` 的位置，没写「拆成两步就失效」；`carry ≤ rbuf` 只在 TCP 路径成立；`MaxPending` 管的不只是暂停；投递预算必须按「轮」且连接级 |
+
 实现层面记录在案的规格偏离（均有代码注释说明理由）：
 
 - kqueue 的 token 不走 `udata` 而走 fd 索引表——Go 的精确 GC 不允许把非指针值

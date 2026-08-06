@@ -341,8 +341,14 @@ onReadable():
 - **小帧（≤ rbuf 容量）走共享 rbuf**，稳态下每连接入站内存为 0。
 - **大帧一次性申请到位**，后续 `read` 直接填剩余区，没有任何重复拷贝，
   也不存在 O(n²)。
-- `carry` 的上界因此是 **rbuf 容量**（64KB），而不是 `MaxMessage`。
-  `Limits.MaxPending` 约束的是「暂停时已读出但未投递」的量，两者不是一回事。
+- `carry` 的上界因此是 **rbuf 容量**（64KB），而不是 `MaxMessage`——
+  **但这只在 TCP 路径上成立**。WS 路径下一个 WS 帧合法地装着远超 rbuf 的
+  gate 字节，投递预算截断留下的 carry 因此可以更大；实现必须直接在 carry
+  缓冲上解析，不能假设它装得进 rbuf（实现期发现的缺陷：拷进 rbuf 会切片
+  越界，把一个合法客户端打成 `ErrHandlerPanic`）。
+- `Limits.MaxPending` 约束的是「**已从内核读出、尚未投递**」的量。它管的不
+  只是暂停：投递预算截断留下的 carry 是同一类字节，同样要受它封顶——
+  否则 WS 下它就是一条无界增长路径。
 
 ### WebSocket 的入站是流式的
 
@@ -531,13 +537,25 @@ type Cipher interface {
 | `Send` / `SendAlone` / `SendFrame` | 取得 outbound 锁、扣预算、接进 stage 1 | 后续任何 `take()` |
 | **`SendFunc`** | **commit 阶段**取得锁并接进 stage 1 | 同上 |
 | `SetCipher` | 同上（追加 barrier）；入站字段在串行域内即时生效 | 编码器 |
-| `Close` | 取得 outbound 锁并置 `closing` | 后续 `Send` 一律 `ErrConnClosed` |
+| `Close` | 取得 outbound 锁并置 `closing`**（同一临界区内记下 `reason`）** | 后续 `Send` 一律 `ErrConnClosed` |
 | `Post` | 推进 loop 的 MPSC | loop 的 drain |
 | `Pause` | 串行域内递增 `depth` | 投递循环 |
 | `resume` | `once` 生效并推进控制项 | loop |
 
 唯一需要的不变式：**先线性化的 `Send`，一定会被后续的排空看到。**
 把「扣预算 + 入队」和「置 `closing`」放进同一把锁的临界区，这个窗口在结构上不存在。
+
+两条容易被拆开、拆开就失效的要求（实现期都栽过）：
+
+- **`closing` 的置位必须发生在 `Close` 返回之前**，不能只标记一个原子量、
+  把 `closing` 推迟到事件循环去置——那样 `OnMessage` 里
+  `c.Close(nil); c.Send(x)` 会成功入队，直接违反
+  [01 的 D15](01-server-api.md#d15-close-之后的-send-行为写成三档而不是承诺一个确定值)
+  「`Close` 返回之后 `Send` 一定报错」这条硬保证。
+- **`reason` 的记录必须与置位在同一临界区**。分成「CAS 一个标志」+「随后写
+  `reason`」两步时，抢到 CAS 的一方可能被抢占，让 CAS 失败的一方先写进
+  `reason`——胜负颠倒，「第一个原因生效」不成立。`nil` 也是合法原因，
+  需要显式的「已定」标记，否则后续错误会替换掉一次正常关闭。
 
 ### `SendFunc` 的两阶段协议
 
@@ -599,7 +617,7 @@ type Cipher interface {
 | --- | --- | --- |
 | accept | 64 个/轮 | 留到下一轮（水平触发会再报） |
 | 单连接读 syscall | 4 次或 256KB | 留到下一轮 |
-| **单连接投递消息数** | 1024 条 | 重新标脏，下一轮继续 |
+| **单连接投递消息数** | 1024 条／**轮** | 重新标脏，下一轮继续 |
 | **单连接写字节 / syscall** | 1MB 或 8 次 `writev` | 保持写兴趣，下一轮继续 |
 | **inbox 项数** | 4096 | 留在 MPSC 里，下一轮继续 |
 | **dirty 连接数** | 全部处理，但每条各自受写预算约束 | — |
@@ -607,6 +625,11 @@ type Cipher interface {
 
 有任何一项因预算被截断时，**本轮的 `wait` timeout 取 0**，
 让下一轮立刻继续，而不是等到下一个事件或截止时刻。
+
+**投递计数必须按「轮」而不是按「读事件」计量，且是连接级的。** WS 下一个
+读事件会被切成很多段 `emit`，carry 的续投又是同一轮里的另一个阶段——
+局部计数会被每段重置，公平预算形同虚设。同理，续投 carry 的阶段要排在
+事件分发**之前**：已经从内核读出来的字节比再读一批更该优先消化。
 
 64KB 的读缓冲里可以放 32768 条空消息，一次可写事件可以排空 1MB，
 一个生产者可以一次投递十万个 dirty 连接——这些都不是理论数字。
