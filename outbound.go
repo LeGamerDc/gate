@@ -112,6 +112,10 @@ type outbound struct {
 	armed        bool // dirty 节点在链中
 	inLoop       bool // loop 正在处理本连接的入站批
 
+	// dirtyNext 是 loop dirty 链的侵入式节点（mpsc.go）。armed 保证单一成员
+	// 资格，因此它只会被「当前持有成员资格的那次 push」触碰。
+	dirtyNext *outbound
+
 	// ── 以下只在 loop 线程访问 ──
 	head, tail  *chunk
 	stage2Bytes int
