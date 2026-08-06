@@ -57,11 +57,13 @@ type loopStats struct {
 	bytesOutRaw atomic.Uint64
 	framesOut   atomic.Uint64
 
-	outboundQueued atomic.Int64
-	pendingInbound atomic.Int64
+	outboundQueued     atomic.Int64
+	pendingInbound     atomic.Int64
+	connsOverHighWater atomic.Int64
 
 	writeEAGAIN   atomic.Uint64
 	sendQueueFull atomic.Uint64
+	loopLagNanos  atomic.Uint64
 
 	closedPeer, closedIdle, closedBackpressure, closedProtocol,
 	closedPanic, closedPauseTimeout, closedHandshakeTimeout,
@@ -83,11 +85,13 @@ func (s *loopStats) snapshot() Stats {
 		BytesOutRaw: s.bytesOutRaw.Load(),
 		FramesOut:   s.framesOut.Load(),
 
-		OutboundQueued: s.outboundQueued.Load(),
-		PendingInbound: s.pendingInbound.Load(),
+		ConnsOverHighWater: s.connsOverHighWater.Load(),
+		OutboundQueued:     s.outboundQueued.Load(),
+		PendingInbound:     s.pendingInbound.Load(),
 
 		WriteEAGAIN:   s.writeEAGAIN.Load(),
 		SendQueueFull: s.sendQueueFull.Load(),
+		LoopLagNanos:  s.loopLagNanos.Load(),
 
 		ClosedPeer:             s.closedPeer.Load(),
 		ClosedIdle:             s.closedIdle.Load(),
@@ -116,8 +120,10 @@ func addStats(dst *Stats, s Stats) {
 	dst.FramesOut += s.FramesOut
 	dst.OutboundQueued += s.OutboundQueued
 	dst.PendingInbound += s.PendingInbound
+	dst.ConnsOverHighWater += s.ConnsOverHighWater
 	dst.WriteEAGAIN += s.WriteEAGAIN
 	dst.SendQueueFull += s.SendQueueFull
+	dst.LoopLagNanos += s.LoopLagNanos
 	dst.ClosedPeer += s.ClosedPeer
 	dst.ClosedIdle += s.ClosedIdle
 	dst.ClosedBackpressure += s.ClosedBackpressure

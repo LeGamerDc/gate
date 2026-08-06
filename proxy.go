@@ -35,6 +35,9 @@ var (
 const (
 	proxyV1MaxLen = 107 // 规范定义的 v1 行最大长度
 	proxyV2MinLen = 16
+	// proxyMaxHeaderLen 是握手期累计字节的宽松上界：v2 的长度字段是 16 位，
+	// TLV 区合法地可以到 64KB。收得下就行，真正的定界由格式自己负责。
+	proxyMaxHeaderLen = proxyV2MinLen + 1<<16
 )
 
 // parseProxy 尝试从 data 头部解出一个 PROXY 头。
@@ -123,6 +126,11 @@ func parseProxyV2(data []byte) (netip.AddrPort, int, error) {
 	if verCmd>>4 != 0x2 {
 		return netip.AddrPort{}, 0, errProxyMalformed
 	}
+	switch verCmd & 0x0F {
+	case 0x0, 0x1: // LOCAL / PROXY
+	default: // 未定义的 command：规范要求拒绝，不能当 PROXY 处理
+		return netip.AddrPort{}, 0, errProxyMalformed
+	}
 	fam := data[13]
 	alen := int(binary.BigEndian.Uint16(data[14:16]))
 	total := proxyV2MinLen + alen
@@ -131,6 +139,10 @@ func parseProxyV2(data []byte) (netip.AddrPort, int, error) {
 	}
 	if verCmd&0x0F == 0x0 { // LOCAL：健康检查等，不带地址语义
 		return netip.AddrPort{}, total, nil
+	}
+	// 低四位是 transport protocol：TCP listener 上只接受 STREAM（或 UNSPEC）。
+	if p := fam & 0x0F; p != 0x0 && p != 0x1 {
+		return netip.AddrPort{}, 0, errProxyMalformed
 	}
 	body := data[16:total]
 	switch fam >> 4 {

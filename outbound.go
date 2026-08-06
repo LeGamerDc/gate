@@ -117,6 +117,8 @@ type outbound struct {
 	armed        bool // dirty 节点在链中
 	inLoop       bool // loop 正在处理本连接的入站批
 
+	overHigh bool // 已计入 ConnsOverHighWater（水位穿越是边沿事件）
+
 	// dirtyNext 是 loop dirty 链的侵入式节点（mpsc.go）。armed 保证单一成员
 	// 资格，因此它只会被「当前持有成员资格的那次 push」触碰。
 	dirtyNext *outbound
@@ -167,7 +169,24 @@ func (o *outbound) admitLocked(charge int) bool {
 		return false // 全局预算耗尽：同样是准入拒绝，帧流没有洞
 	}
 	o.reservedWire += charge
+	o.env.stats.outboundQueued.Add(int64(charge))
+	o.syncWaterLocked()
 	return true
+}
+
+// syncWaterLocked 维护 ConnsOverHighWater：水位穿越是边沿事件，
+// 逐连接采样在 10 万连接下太贵。必须持有 o.mu。
+func (o *outbound) syncWaterLocked() {
+	over := o.cfg.highWater > 0 && o.reservedWire > o.cfg.highWater
+	if over == o.overHigh {
+		return
+	}
+	o.overHigh = over
+	if over {
+		o.env.stats.connsOverHighWater.Add(1)
+	} else {
+		o.env.stats.connsOverHighWater.Add(-1)
+	}
 }
 
 // refund 退还 n 字节（编码退还、写出退还、abort、discard 都走这里），
@@ -177,7 +196,9 @@ func (o *outbound) refundLocked(n int) {
 		return
 	}
 	o.reservedWire -= n
+	o.env.stats.outboundQueued.Add(int64(-n))
 	o.env.quota.release(n)
+	o.syncWaterLocked()
 }
 
 // enqueueLocked 完成入队与 arm，返回是否需要锁外唤醒。
@@ -316,7 +337,9 @@ func (o *outbound) sendFunc(n int, fill func([]byte) (int, error)) error {
 	charge := o.charge(k, o.tailCipher)
 	if delta := charge - reserved; delta > 0 {
 		o.reservedWire += delta
+		o.env.stats.outboundQueued.Add(int64(delta))
 		o.env.quota.acquire(delta) // 已过准入的消息不再拒绝，但账要平
+		o.syncWaterLocked()
 	} else {
 		o.refundLocked(-delta)
 	}
@@ -356,6 +379,7 @@ func (o *outbound) sendRaw(b []byte, force bool) error {
 	}
 	if force {
 		o.reservedWire += len(b) // 收尾帧豁免准入，但仍要计入账面
+		o.env.stats.outboundQueued.Add(int64(len(b)))
 		o.env.quota.acquire(len(b))
 	} else if !o.admitLocked(len(b)) {
 		o.mu.Unlock()

@@ -211,6 +211,7 @@ func (s *Server[S]) Stats() Stats {
 	for _, l := range s.loops {
 		addStats(&out, l.stats.snapshot())
 	}
+	out.PoolMiss = poolMisses.Load() // 分级池是全局的，不按 loop 求和
 	return out
 }
 
@@ -554,7 +555,9 @@ func (s *Server[S]) proxyRead(l *loop, c *connCore) {
 			return
 		}
 		if consumed == 0 {
-			if len(c.in.carry) > proxyV1MaxLen+proxyV2MinLen+216 {
+			// v2 的长度字段是 16 位，TLV 区合法地可以很长；这里给一个宽松
+			// 上界即可（真正的定界由 v1 的 \r\n 与 v2 的长度字段负责）。
+			if len(c.in.carry) > proxyMaxHeaderLen {
 				l.closeLocal(c, wrapProtocol(errProxyMalformed))
 				return
 			}

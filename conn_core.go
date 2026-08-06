@@ -34,9 +34,19 @@ type inboundState struct {
 	carry []byte // 分级池；不足一帧的残片，上界 = rbuf 容量
 	body  []byte // 大帧目标缓冲（分级池，含帧头），非 nil 即处于大帧直读中
 	got   int    // body 已填充字节数
+	acct  int    // 已计入 Stats.PendingInbound 的字节数
 }
 
-func (in *inboundState) release() {
+// syncPending 把「已读出未投递」的字节数同步进统计（增量口径）。
+func (in *inboundState) syncPending(st *loopStats) {
+	want := len(in.carry) + len(in.body)
+	if d := want - in.acct; d != 0 {
+		st.pendingInbound.Add(int64(d))
+		in.acct = want
+	}
+}
+
+func (in *inboundState) release(st *loopStats) {
 	if in.carry != nil {
 		poolPut(in.carry)
 		in.carry = nil
@@ -46,6 +56,7 @@ func (in *inboundState) release() {
 		in.body = nil
 	}
 	in.got = 0
+	in.syncPending(st)
 }
 
 // connCore 是连接的「核」：全部可变状态与 loop 资源。壳（泛型 Conn[S]）持

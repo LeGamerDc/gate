@@ -187,6 +187,19 @@ func (h *harness) verifyConservation() {
 	if l.nconns != 0 {
 		h.t.Fatalf("nconns=%d", l.nconns)
 	}
+	// 水位类计数器必须回零：它们是增量维护的，任何一处漏配对都会滞留。
+	if got := l.stats.outboundQueued.Load(); got != 0 {
+		h.t.Fatalf("Stats.OutboundQueued=%d, want 0", got)
+	}
+	if got := l.stats.pendingInbound.Load(); got != 0 {
+		h.t.Fatalf("Stats.PendingInbound=%d, want 0", got)
+	}
+	if got := l.stats.connsOverHighWater.Load(); got != 0 {
+		h.t.Fatalf("Stats.ConnsOverHighWater=%d, want 0", got)
+	}
+	if got := l.stats.connsPaused.Load(); got != 0 {
+		h.t.Fatalf("Stats.ConnsPaused=%d, want 0", got)
+	}
 	if len(l.free) != len(l.slots) {
 		h.t.Fatal("槽位未全部归还")
 	}

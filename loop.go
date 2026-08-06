@@ -279,6 +279,8 @@ func (l *loop) step() {
 	}
 	l.truncated = false
 	l.tick++
+	iterStart := l.now()
+	defer func() { l.stats.loopLagNanos.Add(uint64(max(0, l.now()-iterStart))) }()
 
 	// 阶段 0：上一轮被预算截断的收件箱余项，以及上一轮留下的 carry
 	// （投递预算截断 / resume 之后的续投）。**先于新事件**处理：
@@ -493,6 +495,7 @@ func (l *loop) connReadable(c *connCore) {
 			if c.in.got == len(c.in.body) {
 				body := c.in.body
 				c.in.body, c.in.got = nil, 0
+				c.in.syncPending(l.stats)
 				l.deliverFrameBuf(c, body)
 			}
 			continue
@@ -510,6 +513,7 @@ func (l *loop) connReadable(c *connCore) {
 			copy(l.rbuf, c.in.carry)
 			poolPut(c.in.carry)
 			c.in.carry = nil
+			c.in.syncPending(l.stats)
 		}
 		if !l.parseAndDeliver(c, l.rbuf[:carryLen+n]) {
 			return
@@ -571,6 +575,7 @@ func (l *loop) parseAndDeliver(c *connCore, data []byte) bool {
 				c.in.body = poolGet(need)
 				copy(c.in.body, data)
 				c.in.got = len(data)
+				c.in.syncPending(l.stats)
 				return true
 			}
 			l.stashCarry(c, data, false) // 下一轮就够了；carry ≤ rbuf 容量
@@ -627,6 +632,7 @@ func (l *loop) stashCarry(c *connCore, data []byte, bounded bool) {
 		copy(buf, data)
 		c.in.carry = buf
 	}
+	c.in.syncPending(l.stats)
 	if bounded && len(data)+c.in.got > l.cfg.maxPending {
 		l.closeLocal(c, ErrPendingOverflow)
 	}
@@ -659,6 +665,7 @@ func (l *loop) processCarry(c *connCore) {
 	c.startDeliverBudget(l)
 	carry := c.in.carry
 	c.in.carry = nil
+	c.in.syncPending(l.stats)
 	l.parseAndDeliver(c, carry)
 	poolPut(carry)
 }
@@ -736,7 +743,7 @@ func (l *loop) detach(c *connCore) {
 	_ = l.io.close(c.fd)
 	// 4. 丢弃 stage1/stage2，归还池内存，退还预算。
 	c.out.discard()
-	c.in.release()
+	c.in.release(l.stats)
 	if c.ws != nil {
 		c.ws.release()
 	}

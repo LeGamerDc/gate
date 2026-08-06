@@ -117,6 +117,7 @@ func (l *loop) wsGateFeed(c *connCore, seg []byte) error {
 			poolPut(c.in.carry)
 		}
 		c.in.carry = nil
+		c.in.syncPending(l.stats)
 		data = merged
 	}
 	// 暂停 / 投递预算截断 / 大帧接管都在 parseAndDeliver 内部 stash 进 carry。

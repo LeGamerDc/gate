@@ -186,6 +186,18 @@ func (w *wsState) beginFrame() error {
 	}
 
 	plen := int64(b1 & 0x7F)
+	isCtrl := op >= wsOpClose
+	// 5/6 先于 7：控制帧的长度标记只要不是 7 位直写就已经 > 125，
+	// 读到第二个字节就能拒——不必先去解扩展长度再报一个 non-canonical。
+	// 校验顺序本身是规格的一部分（错误分类与拒绝时机都不同）。
+	if isCtrl {
+		if plen > wsMaxCtrlPayload {
+			return errWSCtrlTooLong
+		}
+		if !fin {
+			return errWSCtrlFragment
+		}
+	}
 	off := 2
 	switch plen {
 	case 126:
@@ -205,15 +217,7 @@ func (w *wsState) beginFrame() error {
 		plen, off = int64(u), 10
 	}
 
-	isCtrl := op >= wsOpClose
-	if isCtrl {
-		if plen > wsMaxCtrlPayload { // 5. 必须早于收 payload
-			return errWSCtrlTooLong
-		}
-		if !fin { // 6. 控制帧不得分片
-			return errWSCtrlFragment
-		}
-	} else if plen > wsMaxFrameLen { // 9. 宽松上界，不是 MaxMessage（W14）
+	if !isCtrl && plen > wsMaxFrameLen { // 9. 宽松上界，不是 MaxMessage（W14）
 		return errWSFrameTooLong
 	}
 	if !masked { // 10. RFC 硬要求：客户端帧必须带掩码

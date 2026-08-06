@@ -73,8 +73,9 @@ func parseUpgrade(reqBytes []byte, opts *WebSocketOptions) (*Handshake, string, 
 		return nil, "", fmt.Errorf("%w: unsupported version", errWSBadUpgrade)
 	}
 	key := req.Header.Get("Sec-WebSocket-Key")
-	if key == "" {
-		return nil, "", fmt.Errorf("%w: missing key", errWSBadUpgrade)
+	// RFC 6455 §4.1：必须是 16 字节随机数的 base64。只查非空会接受无效握手。
+	if k, err := base64.StdEncoding.DecodeString(key); err != nil || len(k) != 16 {
+		return nil, "", fmt.Errorf("%w: bad key", errWSBadUpgrade)
 	}
 	return &Handshake{URI: req.RequestURI, Header: req.Header}, key, nil
 }
@@ -187,10 +188,15 @@ func (l *loop) wsHsReadable(c *connCore, opts *WebSocketOptions, done func(hs *H
 			}()
 			if uerr != nil {
 				var rej *upgradeRejection
-				if errors.As(uerr, &rej) {
+				switch {
+				case errors.As(uerr, &rej):
 					l.wsReject(c, rej.status, rej.reason, uerr)
-				} else {
-					l.wsReject(c, http.StatusForbidden, "forbidden", uerr)
+				case errors.Is(uerr, ErrHandlerPanic):
+					// 01 的回调表：OnUpgrade panic 按 500 拒绝。
+					l.wsReject(c, http.StatusInternalServerError, "internal error", uerr)
+				default:
+					// 01：返回任意非 nil error 即拒绝握手（默认 401）。
+					l.wsReject(c, http.StatusUnauthorized, "unauthorized", uerr)
 				}
 				return
 			}
@@ -201,6 +207,7 @@ func (l *loop) wsHsReadable(c *connCore, opts *WebSocketOptions, done func(hs *H
 		_ = c.out.sendRaw(build101(key), false)
 		carry := c.in.carry
 		c.in.carry = nil
+		c.in.syncPending(l.stats)
 		leftover := carry[reqEnd:]
 
 		enableWS(c)

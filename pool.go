@@ -3,8 +3,13 @@ package gate
 import (
 	"math/bits"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
+
+// poolMisses 统计「池里没有、走了新分配」的次数（Stats.PoolMiss）。
+// 稳态下它应该基本不涨；持续上涨说明分级不匹配或 GC 在反复清池。
+var poolMisses atomic.Uint64
 
 // 全局并发安全分级池（06 字节所有权表里的「分级池」）。
 //
@@ -39,12 +44,14 @@ func poolClass(n int) int {
 func poolGet(n int) []byte {
 	c := poolClass(n)
 	if c < 0 {
+		poolMisses.Add(1)
 		return make([]byte, n)
 	}
 	size := 1 << (poolMinBits + c)
 	if p, _ := pools[c].Get().(*byte); p != nil {
 		return unsafe.Slice(p, size)[:n]
 	}
+	poolMisses.Add(1)
 	return make([]byte, size)[:n]
 }
 
