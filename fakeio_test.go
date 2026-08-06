@@ -3,6 +3,7 @@ package gate
 import (
 	"bytes"
 	"slices"
+	"syscall"
 	"testing"
 )
 
@@ -56,12 +57,27 @@ func (f *fakeIO) writev(_ int, vec [][]byte) (int, error) {
 
 func (f *fakeIO) read(_ int, p []byte) (int, error) {
 	if len(f.readScript) == 0 {
-		return 0, nil
+		return 0, syscall.EAGAIN // 无剧本 = 内核没数据
 	}
 	step := f.readScript[0]
-	f.readScript = f.readScript[1:]
 	n := copy(p, step.data)
+	if n < len(step.data) {
+		// p 装不下这一步的剩余数据：留给下一次 read（大帧直读分多次取）。
+		f.readScript[0].data = step.data[n:]
+		return n, nil
+	}
+	f.readScript = f.readScript[1:]
+	if n == 0 && step.err == nil {
+		return 0, nil // 显式 EOF 步
+	}
 	return n, step.err
+}
+
+// feed 追加读数据步。
+func (f *fakeIO) feed(chunks ...[]byte) {
+	for _, c := range chunks {
+		f.readScript = append(f.readScript, readStep{data: c})
+	}
 }
 
 func (f *fakeIO) close(_ int) error {

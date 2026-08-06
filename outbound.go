@@ -121,13 +121,15 @@ type outbound struct {
 	stage2Bytes int
 	encCipher   Cipher // 编码流推进到的 cipher epoch
 
-	cfg     outConfig
-	io      connIO
-	fd      int
-	env     *loopEnv
-	loop    dirtyPoster
-	fatal   func(error) // 编码/写失败：outbound 已自关，宿主关连接（O8）。loop 线程。
-	onPanic func(error) // SendFunc 的 fill panic：按 OnMessage panic 处理（宿主关连接）。任意 goroutine。
+	cfg      outConfig
+	io       connIO
+	fd       int
+	env      *loopEnv
+	loop     dirtyPoster
+	owner    *connCore   // 所属连接（loop 的 dirty 处理与写状态回填用）；测试可为 nil
+	fatal    func(error) // 编码/写失败：outbound 已自关，宿主关连接（O8）。loop 线程。
+	onPanic  func(error) // SendFunc 的 fill panic：按 OnMessage panic 处理（宿主关连接）。任意 goroutine。
+	progress func()      // 每次写出 ≥1 字节时回调（stall LRU 的 lastProgress）。loop 线程。
 }
 
 func newOutbound(cfg outConfig, io connIO, fd int, env *loopEnv, loop dirtyPoster) *outbound {
@@ -570,10 +572,21 @@ func (o *outbound) pushFrameChunks(bf *builtFrame, appendChunk func(*chunk)) {
 	}
 }
 
+// 单连接一次事件的写预算（06「公平性预算」）：超出后保持写兴趣让给别的连接，
+// 水平触发下一轮还会报可写。
+const (
+	writeBudgetBytes = 1 << 20
+	writeBudgetCalls = 8
+)
+
 // write 按 06 的写循环执行：凑 iovec → writev → 推进 off → 退还预算。
 // 返回 writeFailed 时错误一并返回，由调用方走 failLoop。
 func (o *outbound) write() (writeStatus, error) {
+	written, calls := 0, 0
 	for o.head != nil {
+		if written >= writeBudgetBytes || calls >= writeBudgetCalls {
+			return writeBlocked, nil // 预算耗尽：保持写兴趣，下一轮继续
+		}
 		vec := o.env.iov[:0]
 		want := 0
 		for c := o.head; c != nil && len(vec) < iovMax; c = c.next {
@@ -582,14 +595,19 @@ func (o *outbound) write() (writeStatus, error) {
 			want += len(b)
 		}
 		n, err := o.io.writev(o.fd, vec)
+		calls++
 		for i := range vec {
 			vec[i] = nil // 不让 iovec 暂存钉住已写完的缓冲
 		}
 		if n > 0 {
+			written += n
 			o.advance(n)
 			o.mu.Lock()
 			o.reservedWire -= n // 写出退还（第二段）
 			o.mu.Unlock()
+			if o.progress != nil {
+				o.progress() // lastProgress：stall LRU 移尾
+			}
 		}
 		if err != nil {
 			if errors.Is(err, syscall.EAGAIN) {
@@ -625,10 +643,9 @@ func (o *outbound) advance(n int) {
 	}
 }
 
-// failLoop 是写/编码失败路径（O8）：先关 outbound——置 closing、丢弃两级队列、
-// 清账——再通知宿主关连接。并发的 Send 从此刻起一律 ErrConnClosed，
-// 不可能往有洞的帧流里再写。只能在 loop 线程调用（要触碰 stage 2）。
-func (o *outbound) failLoop(err error) {
+// discard 关闭并丢弃两级队列、清账（06 拆除序列第 4 步；写失败路径的前半）。
+// 之后的 Send 一律 ErrConnClosed。只能在 loop 线程调用（要触碰 stage 2）。
+func (o *outbound) discard() {
 	o.mu.Lock()
 	o.closing = true
 	items := o.q1
@@ -644,7 +661,12 @@ func (o *outbound) failLoop(err error) {
 		c = next
 	}
 	o.head, o.tail, o.stage2Bytes = nil, nil, 0
+}
 
+// failLoop 是写/编码失败路径（O8）：先关 outbound（discard），再通知宿主关连接。
+// 并发的 Send 从 discard 起一律 ErrConnClosed，不可能往有洞的帧流里再写。
+func (o *outbound) failLoop(err error) {
+	o.discard()
 	if o.fatal != nil {
 		o.fatal(err)
 	}

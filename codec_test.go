@@ -136,17 +136,27 @@ func TestCodecStep8_CipherConsistency(t *testing.T) {
 }
 
 // 任何合法帧的每一个真前缀都必须返回「数据不足」，而不是错误。
+// 帧头完整时 n 报告凑齐该帧所需的总字节数（大帧路径的决策依据），否则为 0。
 func TestCodecStep9_EveryPrefixRetryable(t *testing.T) {
 	c := serverCodec(maxMessageSize)
 	for _, size := range []int{0, 1, 100, 4095, 4096, 65535, 65536} {
 		full := rawFrame(0, size, size >= smallSizeLimit, mkPayload(size))
+		hdrLen := headerSize(size)
 		for _, cut := range []int{0, 1, 2, 3, len(full) / 2, len(full) - 1} {
 			if cut >= len(full) {
 				continue
 			}
-			_, _, ok, err := c.parse(full[:cut])
+			_, n, ok, err := c.parse(full[:cut])
 			if ok || err != nil {
 				t.Fatalf("size=%d cut=%d: want 数据不足, got ok=%v err=%v", size, cut, ok, err)
+			}
+			if want := 0; cut >= hdrLen {
+				want = len(full)
+				if n != want {
+					t.Fatalf("size=%d cut=%d: n=%d want %d", size, cut, n, want)
+				}
+			} else if n != 0 {
+				t.Fatalf("size=%d cut=%d: 头未完整 n 应为 0, got %d", size, cut, n)
 			}
 		}
 		f, n, ok, err := c.parse(full)

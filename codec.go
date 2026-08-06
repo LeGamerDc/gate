@@ -52,7 +52,10 @@ func (f frame) e() bool { return f.flags&flagE != 0 }
 //
 // 返回值只有两种非成功形态，类型上不可混淆（W8）：
 //
-//	ok = false, err = nil ⇒ 数据不足，保留字节等下一次读事件（唯一可重试的返回）
+//	ok = false, err = nil ⇒ 数据不足，保留字节等下一次读事件（唯一可重试的返回）。
+//	                        此时若帧头已完整（1~8 步已通过），n 是凑齐该帧所需的
+//	                        总字节数——读路径靠它决定走 rbuf 还是大帧直读；
+//	                        帧头本身不全时 n = 0。
 //	err != nil            ⇒ 协议违规，关闭连接
 func (c codec) parse(src []byte) (f frame, n int, ok bool, err error) {
 	if len(src) < minHeaderSize { // 1. 数据不足
@@ -88,7 +91,8 @@ func (c codec) parse(src []byte) (f frame, n int, ok bool, err error) {
 		}
 		return
 	}
-	if len(src) < hdr+size { // 9. 数据不足
+	if len(src) < hdr+size { // 9. 数据不足；带回总帧长供大帧路径决策
+		n = hdr + size
 		return
 	}
 	// 10. 三索引切片封住 cap：sink 里的 append 不可能覆盖相邻字节
