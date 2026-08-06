@@ -3,6 +3,7 @@
 package gate
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"net/http"
@@ -57,12 +58,36 @@ func TestP1_OnUpgradeRejectStatusCodes(t *testing.T) {
 // 05 校验清单：控制帧的长度/FIN 校验（第 5、6 步）必须早于扩展长度的
 // 规范性检查（第 7 步）——错误分类与拒绝时机都不同。
 func TestP1_ControlLengthCheckedBeforeExtendedLength(t *testing.T) {
-	// ping 用 126 长度标记：第 5 步就该判「控制帧超 125」，
-	// 而不是先解扩展长度再报 non-canonical。
-	raw := []byte{wsFinBit | wsOpPing, wsMaskBit | 126, 0, 100}
-	raw = append(raw, testMask[:]...)
+	// 拒绝时机也是规格：只给两个字节就该判「控制帧超 125」，
+	// 而不是等 8 字节扩展长度和 4 字节掩码到齐。
 	w := &wsState{}
 	var col wsCollector
+	if err := feedCollect(w, &col, []byte{wsFinBit | wsOpPing, wsMaskBit | 126}); !errors.Is(err, errWSCtrlTooLong) {
+		t.Fatalf("两字节即可判定: got %v, want errWSCtrlTooLong", err)
+	}
+	// 分片的控制帧同理（第 6 步）。
+	w = &wsState{}
+	if err := feedCollect(w, &col, []byte{wsOpPing, wsMaskBit | 4}); !errors.Is(err, errWSCtrlFragment) {
+		t.Fatalf("got %v, want errWSCtrlFragment", err)
+	}
+	// RSV / text / 保留 opcode 同样只需两字节。
+	for _, tc := range []struct {
+		b0   byte
+		want error
+	}{
+		{wsFinBit | 0x40 | wsOpBinary, errWSRsv},
+		{wsFinBit | wsOpText, errWSText},
+		{wsFinBit | 0x3, errWSOpcode},
+	} {
+		w = &wsState{}
+		if err := feedCollect(w, &col, []byte{tc.b0, wsMaskBit | 4}); !errors.Is(err, tc.want) {
+			t.Fatalf("b0=%#x: got %v, want %v", tc.b0, err, tc.want)
+		}
+	}
+
+	raw := []byte{wsFinBit | wsOpPing, wsMaskBit | 126, 0, 100}
+	raw = append(raw, testMask[:]...)
+	w = &wsState{}
 	if err := feedCollect(w, &col, raw); !errors.Is(err, errWSCtrlTooLong) {
 		t.Fatalf("got %v, want errWSCtrlTooLong", err)
 	}
@@ -91,6 +116,19 @@ func TestP1_ProxyV2SemanticValidation(t *testing.T) {
 	}
 	if _, _, err := parseProxy(base(0x21, 0x12), true); !errors.Is(err, errProxyMalformed) {
 		t.Fatalf("DGRAM 应在 TCP listener 上拒绝: %v", err)
+	}
+	// 未知 family 必须拒绝：放行等于让上游用一个我们不理解的地址族决定 Remote()。
+	for _, fam := range []byte{0x41, 0x51, 0xF1} {
+		if _, _, err := parseProxy(base(0x21, fam), true); !errors.Is(err, errProxyMalformed) {
+			t.Fatalf("fam=%#x 应拒绝: %v", fam, err)
+		}
+	}
+	// AF_UNIX 的地址区固定 216 字节，短了就是畸形。
+	short := append([]byte(nil), proxyV2Sig...)
+	short = append(short, 0x21, 0x31, 0x00, 12)
+	short = append(short, make([]byte, 12)...)
+	if _, _, err := parseProxy(short, true); !errors.Is(err, errProxyMalformed) {
+		t.Fatalf("AF_UNIX 短地址区应拒绝: %v", err)
 	}
 	src, n, err := parseProxy(base(0x21, 0x11), true) // PROXY + AF_INET|STREAM
 	if err != nil || n != 28 || src.Addr().String() != "1.2.3.4" {
@@ -170,6 +208,33 @@ func TestP1_StatsWaterMarksAreLive(t *testing.T) {
 	if final.OutboundQueued != 0 || final.ConnsOverHighWater != 0 {
 		t.Fatalf("关闭后水位未归零: %+v", final)
 	}
+}
+
+// BytesOutRaw 是压缩率的分母：Frame 已经可能是压缩后的字节，
+// 用 len(wire) 计会把压缩率算成 1。
+func TestP1_FrameBytesOutRawUsesOriginalLength(t *testing.T) {
+	payload := bytes.Repeat([]byte("compressible"), 200)
+	enc := mustEncoder(t)
+	f, err := newFrame(payload, Outbound{CompressThreshold: 64}, enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.wire) >= len(payload) {
+		t.Fatal("语料没被压缩，测不出差异")
+	}
+	o, _, loop := newTestOutbound(t)
+	if err := o.sendFrame(f); err != nil {
+		t.Fatal(err)
+	}
+	loop.drainDirty()
+	st := o.env.stats.snapshot()
+	if st.BytesOutRaw != uint64(len(payload)) {
+		t.Fatalf("BytesOutRaw=%d, want %d（原始 payload 长度）", st.BytesOutRaw, len(payload))
+	}
+	if st.BytesOut >= st.BytesOutRaw {
+		t.Fatalf("压缩率算反了: out=%d raw=%d", st.BytesOut, st.BytesOutRaw)
+	}
+	afterOutbound(t, o)
 }
 
 func TestP1_StatsPoolMissCounted(t *testing.T) {

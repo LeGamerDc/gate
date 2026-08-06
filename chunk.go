@@ -47,10 +47,12 @@ func (c *chunk) release() {
 
 // chunkSlab 是每 loop 的 chunk 节点自由链，只在 loop 线程上取放，无锁。
 type chunkSlab struct {
-	free *chunk
+	free        *chunk
+	outstanding int // 已借出未归还的节点数（配平断言用；非原子——只在 loop 上动）
 }
 
 func (s *chunkSlab) get() *chunk {
+	s.outstanding++
 	if c := s.free; c != nil {
 		s.free = c.next
 		c.next = nil
@@ -60,6 +62,7 @@ func (s *chunkSlab) get() *chunk {
 }
 
 func (s *chunkSlab) put(c *chunk) {
+	s.outstanding--
 	*c = chunk{next: s.free}
 	s.free = c
 }

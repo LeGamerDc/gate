@@ -39,6 +39,11 @@ jobs:
       - name: race
         run: go test -race -count=1 ./...
 
+      # 07 第 3 层的资源配平：分级池借还、chunk slab、loop 配额。
+      # 计数点在热路径上，所以默认编译成空函数，只在这一轮打开。
+      - name: conservation accounting
+        run: go test -tags gatedebug -count=1 ./...
+
       # 第 6 层的硬断言：0 allocs/op 回归即失败。
       - name: zero-alloc guards
         run: go test -count=1 -run 'TestZeroAlloc' ./...

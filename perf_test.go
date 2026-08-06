@@ -2,6 +2,7 @@ package gate
 
 import (
 	"testing"
+	"time"
 )
 
 // 07 第 6 层：性能护栏分两级——「硬断言」（0 allocs/op，回归即失败）
@@ -163,4 +164,63 @@ func BenchmarkCodecParseDeliver(b *testing.B) {
 		_ = c.deliver(f, nil, nil, func(m []byte, _ bool) error { sink += len(m); return nil })
 	}
 	_ = sink
+}
+
+// 07 第 3 层要求的「每个池借出计数 == 归还计数」。它是进程级计数器，
+// 并行存在的 server loop 会让它漂移，所以不放进 harness 的 afterEach，
+// 而是用一个独占的用例跑一遍有代表性的负载再断言。
+//
+// 只在 -tags gatedebug 下有数（默认构建里计数函数是空的——它们在热路径上）。
+func TestPoolBalanceAcrossWorkload(t *testing.T) {
+	if !debugAccounting {
+		t.Skip("需要 -tags gatedebug")
+	}
+	before := poolOutstanding()
+
+	// TCP：小帧、空帧、大帧直读、合包、压缩、AEAD、部分写、carry 切分。
+	h := newHarness(t, func(c *loopConfig) {
+		c.out.maxCluster = 256
+		c.out.compressThreshold = 64
+	})
+	sender, recv := pairGCM([16]byte{5})
+	h.c.setCipher(recv)
+	h.l.step()
+	h.onMsg = func(msg []byte) error { return h.c.out.send(msg, flagZ|flagC|flagE) }
+
+	var stream []byte
+	for _, m := range [][]byte{{}, mkPayload(10), mkPayload(3000), mkPayload(100 << 10)} {
+		bf, err := buildFrame(append([]byte(nil), m...), 0, nil, false, sender, maxMessageSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stream = append(stream, wire(&bf)...)
+	}
+	for i := 0; i < len(stream); i += 7000 {
+		h.io.feed(stream[i:min(i+7000, len(stream))])
+	}
+	h.io.script = []ioStep{{accept: 13, err: errEAGAIN}}
+	for range 30 {
+		h.readable()
+		h.writable()
+	}
+	h.c.requestClose(nil)
+	h.advance(2 * time.Second)
+	h.l.step()
+	h.verifyConservation()
+
+	// WS：握手、流式解帧、控制帧、carry。
+	hw := newWSHarness(t)
+	hw.io.feed(wsClientFrame(true, wsOpPing, []byte("ka"), testMask))
+	hw.io.feed(wsClientFrame(true, wsOpBinary, gateWire(t, mkPayload(500), mkPayload(80<<10)), testMask))
+	for range 6 {
+		hw.readable()
+	}
+	hw.c.requestClose(nil)
+	hw.advance(2 * time.Second)
+	hw.l.step()
+	hw.verifyConservation()
+
+	if got := poolOutstanding(); got != before {
+		t.Fatalf("分级池借还不配平: %d → %d（漏还 %d 块）", before, got, got-before)
+	}
 }

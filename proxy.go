@@ -132,6 +132,10 @@ func parseProxyV2(data []byte) (netip.AddrPort, int, error) {
 		return netip.AddrPort{}, 0, errProxyMalformed
 	}
 	fam := data[13]
+	// TCP listener 上不接受 DGRAM。
+	if p := fam & 0x0F; p == 0x2 {
+		return netip.AddrPort{}, 0, errProxyMalformed
+	}
 	alen := int(binary.BigEndian.Uint16(data[14:16]))
 	total := proxyV2MinLen + alen
 	if len(data) < total {
@@ -140,27 +144,34 @@ func parseProxyV2(data []byte) (netip.AddrPort, int, error) {
 	if verCmd&0x0F == 0x0 { // LOCAL：健康检查等，不带地址语义
 		return netip.AddrPort{}, total, nil
 	}
-	// 低四位是 transport protocol：TCP listener 上只接受 STREAM（或 UNSPEC）。
-	if p := fam & 0x0F; p != 0x0 && p != 0x1 {
-		return netip.AddrPort{}, 0, errProxyMalformed
-	}
+	// family|protocol 只接受规范定义的组合（HAProxy PROXY protocol §2.2）：
+	// 0x00 UNSPEC、0x11/0x12 INET、0x21/0x22 INET6、0x31/0x32 UNIX。
+	// 未知 family 必须拒绝——放行等于让上游用一个我们不理解的地址族
+	// 决定 Remote()。
 	body := data[16:total]
-	switch fam >> 4 {
-	case 0x1: // AF_INET
+	switch fam {
+	case 0x00: // UNSPEC：合法，但不带地址语义
+		return netip.AddrPort{}, total, nil
+	case 0x11, 0x12: // AF_INET + STREAM/DGRAM
 		if alen < 12 {
 			return netip.AddrPort{}, 0, errProxyMalformed
 		}
 		addr := netip.AddrFrom4([4]byte(body[0:4]))
 		port := binary.BigEndian.Uint16(body[8:10])
 		return netip.AddrPortFrom(addr, port), total, nil
-	case 0x2: // AF_INET6
+	case 0x21, 0x22: // AF_INET6 + STREAM/DGRAM
 		if alen < 36 {
 			return netip.AddrPort{}, 0, errProxyMalformed
 		}
 		addr := netip.AddrFrom16([16]byte(body[0:16]))
 		port := binary.BigEndian.Uint16(body[32:34])
 		return netip.AddrPortFrom(addr, port), total, nil
-	default: // AF_UNSPEC / AF_UNIX：接受但不取地址
+	case 0x31, 0x32: // AF_UNIX：地址区固定 216 字节，我们不取地址
+		if alen < 216 {
+			return netip.AddrPort{}, 0, errProxyMalformed
+		}
 		return netip.AddrPort{}, total, nil
+	default:
+		return netip.AddrPort{}, 0, errProxyMalformed
 	}
 }

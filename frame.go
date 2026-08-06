@@ -6,6 +6,7 @@ import "github.com/klauspost/compress/zstd"
 // 不可变，由 GC 管理生命周期——出站队列写出前持有引用，写完放手（01 D20）。
 type Frame struct {
 	wire []byte // 完整线路字节：帧头 + payload（可能已压缩）。永不改写。
+	raw  int    // 原始 payload 长度：BytesOutRaw 的口径（压缩率的分母）
 }
 
 type frameOptions struct {
@@ -42,5 +43,5 @@ func newFrame(payload []byte, cfg Outbound, enc *zstd.Encoder, opts ...FrameOpti
 	wire = append(wire, bf.hdr[:bf.hdrLen]...)
 	wire = append(wire, bf.body...)
 	bf.release()
-	return &Frame{wire: wire}, nil
+	return &Frame{wire: wire, raw: len(payload)}, nil
 }

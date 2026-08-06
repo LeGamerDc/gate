@@ -44,9 +44,12 @@ func poolClass(n int) int {
 func poolGet(n int) []byte {
 	c := poolClass(n)
 	if c < 0 {
+		// 超过最大类：直接 make，poolPut 也会丢弃它。两侧都不记账，
+		// 配平计数才对称。
 		poolMisses.Add(1)
 		return make([]byte, n)
 	}
+	trackPoolGet(n)
 	size := 1 << (poolMinBits + c)
 	if p, _ := pools[c].Get().(*byte); p != nil {
 		return unsafe.Slice(p, size)[:n]
@@ -60,11 +63,12 @@ func poolGet(n int) []byte {
 func poolPut(b []byte) {
 	c := cap(b)
 	if c < 1<<poolMinBits || c&(c-1) != 0 {
-		return
+		return // 不是任何类的精确容量：调用方 append 换过底层数组，或来自超限 make
 	}
 	k := bits.TrailingZeros(uint(c)) - poolMinBits
 	if k >= poolClasses {
 		return
 	}
+	trackPoolPut(c)
 	pools[k].Put(unsafe.SliceData(b[:1]))
 }

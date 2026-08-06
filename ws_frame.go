@@ -141,6 +141,14 @@ func (w *wsState) feed(raw []byte, emit func([]byte) error, ctrl func(op byte, p
 		copy(w.hdrBuf[w.hdrLen:], raw[:take])
 		w.hdrLen += take
 		raw = raw[take:]
+		// 校验清单第 2~6 步只需要前两个字节：拒绝时机本身是规格的一部分，
+		// 一个「ping + 长度标记 126」不该先把 8 字节扩展长度和掩码等齐
+		// 再报错。
+		if w.hdrLen >= 2 {
+			if err := w.checkEarly(); err != nil {
+				return err
+			}
+		}
 		if w.hdrLen < w.headerNeed() { // 长度字段/掩码会把 need 撑大
 			continue // raw 还有字节就继续取；耗尽时循环顶部返回
 		}
@@ -148,6 +156,32 @@ func (w *wsState) feed(raw []byte, emit func([]byte) error, ctrl func(op byte, p
 			return err
 		}
 	}
+}
+
+// checkEarly 执行只依赖前两个字节的校验（清单第 2~6 步）：RSV、opcode、
+// text、控制帧的长度与 FIN。控制帧的长度标记只要不是 7 位直写就已经 > 125。
+func (w *wsState) checkEarly() error {
+	b0, b1 := w.hdrBuf[0], w.hdrBuf[1]
+	if b0&wsRsvMask != 0 { // 2
+		return errWSRsv
+	}
+	op := b0 & 0x0F
+	switch op {
+	case wsOpContinuation, wsOpBinary, wsOpClose, wsOpPing, wsOpPong:
+	case wsOpText: // 4
+		return errWSText
+	default: // 3
+		return errWSOpcode
+	}
+	if op >= wsOpClose {
+		if b1&0x7F > wsMaxCtrlPayload { // 5
+			return errWSCtrlTooLong
+		}
+		if b0&wsFinBit == 0 { // 6
+			return errWSCtrlFragment
+		}
+	}
+	return nil
 }
 
 // headerNeed 返回按当前已累积的头字节推断的完整头长。

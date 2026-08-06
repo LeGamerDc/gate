@@ -263,7 +263,7 @@ func (o *outbound) sendFrame(f *Frame) error {
 		return ErrSendQueueFull
 	}
 	o.env.stats.messagesOut.Add(1)
-	o.env.stats.bytesOutRaw.Add(uint64(len(f.wire)))
+	o.env.stats.bytesOutRaw.Add(uint64(f.raw)) // 压缩率的分母是原始 payload
 	wake := o.enqueueLocked(stage1Item{kind: itemFrame, frame: f})
 	o.mu.Unlock()
 	if wake {

@@ -200,6 +200,18 @@ func (h *harness) verifyConservation() {
 	if got := l.stats.connsPaused.Load(); got != 0 {
 		h.t.Fatalf("Stats.ConnsPaused=%d, want 0", got)
 	}
+	// 07 第 3 层要求的配平：chunk slab 全部归还、loop 配额回到初值、
+	// 分级池借出计数 == 归还计数（最后一项只在 -tags gatedebug 下有数）。
+	if got := l.env.slab.outstanding; got != 0 {
+		h.t.Fatalf("chunk slab 未归还 %d 个节点", got)
+	}
+	if got := l.env.quota.outstanding.Load(); got != 0 {
+		h.t.Fatalf("loop 配额未归零: outstanding=%d", got)
+	}
+	// 分级池的借还配平不放在这里断言：那个计数器是**进程级**的，
+	// 而并行存在的其它 server（E2E 用例）的 loop 会在它下面漂移。
+	// 精确到这条连接的配平由上面几项覆盖；池的整体配平见
+	// TestPoolBalanceAcrossWorkload（独占运行）。
 	if len(l.free) != len(l.slots) {
 		h.t.Fatal("槽位未全部归还")
 	}

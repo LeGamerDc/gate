@@ -26,9 +26,11 @@ type Stats struct {
 	FramesOut   uint64 // 线路帧数
 
 	// 资源水位
-	OutboundQueued int64  // 当前出站积压总字节（reservedWire 口径）
-	PendingInbound int64  // 当前入站残片总字节
-	PoolMiss       uint64 // 分级池取不到、走了新分配
+	OutboundQueued int64 // 当前出站积压总字节（reservedWire 口径）
+	PendingInbound int64 // 当前入站残片总字节
+	// PoolMiss 是**进程级**的：分级池被所有 server 共享，同进程起多个
+	// server 时这个数不区分来源。稳态下它应该基本不涨。
+	PoolMiss uint64
 
 	// 压力信号
 	WriteEAGAIN   uint64 // writev 写不完的次数
