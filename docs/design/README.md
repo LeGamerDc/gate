@@ -102,3 +102,20 @@ WebSocket 的封帧挂在出站的最后一跳，而三者对「谁维护残片�
 06 末尾的勘误表经复核后已**全部回改**进 01–05（复核同时修正了 06 自身的几处缺陷，
 见其勘误一节的说明），六份文档现已自洽。07 把三张不变式表与 06 的状态机变成
 可执行的判据——每条不变式都能在测试名里 grep 到。
+
+---
+
+## 实现状态
+
+本文档集对应的实现已在仓库根目录完成（按 codec → outbound → poller → loop/状态机
+→ WebSocket → server 装配 → 性能护栏的顺序，每层一个 commit）。实现期发现并回改的
+文档问题：`CloseLinger` 的零值语义（零值 = 默认 1s，`Unlimited` = 立即关闭）。
+实现层面记录在案的规格偏离（均有代码注释说明理由）：
+
+- kqueue 的 token 不走 `udata` 而走 fd 索引表——Go 的精确 GC 不允许把非指针值
+  塞进 `Kevent_t.Udata`（`*byte`）字段；epoll 侧 token 照旧进 `epoll_data.u64`。
+- 连接拆除（`Draining → Detached`）内联在事件处理中执行，而不是 04 所述的
+  「统一在阶段 4」——槽位 generation 已在结构上挡住陈旧事件，独立回收阶段的
+  防护目的不再需要额外机制。
+- compound 分组上限在编码期动态再夹掉当前 cipher 的 `Overhead()`（构造期夹不掉：
+  cipher 是运行时可换的，而 body+Overhead 不能越协议上限）。

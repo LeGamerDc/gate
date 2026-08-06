@@ -594,7 +594,7 @@ per-connection 独立密钥和「编码一次分发多次」在根本上不兼�
 ### 「尽力 flush」到底承诺了什么
 
 **承诺：** 已入队的消息不会**因为你调用了 `Close`** 而被丢弃。gate 会在关闭前继续
-尝试把它们写出去，最多再等 `Outbound.CloseLinger`（默认 1s，`0` 表示立即关闭）。
+尝试把它们写出去，最多再等 `Outbound.CloseLinger`（零值默认 1s，`Unlimited` 表示不等待、立即关闭）。
 
 **不承诺：** 它们一定到达对端。一个不读数据的慢客户端会让 socket 缓冲一直是满的，
 `CloseLinger` 到期后 gate 照常关闭连接并丢弃剩余字节——**否则一条卡死的连接可以无限期
@@ -987,7 +987,7 @@ data race。同理 `DefaultOutbound()` 是**函数**而不是可变的包级变�
 | `MaxBuffer` | **1MB** | 出站积压准入上限，越过时 `Send` 返回 `ErrSendQueueFull`。`gate.Unlimited` 关闭 |
 | `HighWater` | `MaxBuffer / 4` | 软上限，越过后 `Writable()` 返回 false |
 | `StallTimeout` | **30s** | 积压非空且这么久一个字节都没写出去 ⇒ 关闭。`gate.Unlimited` 关闭 |
-| `CloseLinger` | **1s** | `Close` 之后为排空出站队列最多再等多久；`0` 表示立即关闭 |
+| `CloseLinger` | **1s** | `Close` 之后为排空出站队列最多再等多久；`gate.Unlimited` 表示不等待、立即关闭（linger 的「保护」是给排空封顶，关掉上限即不等） |
 
 **合并与压缩是相互独立的开关。** 关掉压缩不会连带关掉合并——大量小消息正是
 「该合包但不值得压缩」的典型场景，合包本身就能省下系统调用和小 TCP 段。
