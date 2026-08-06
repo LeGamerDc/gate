@@ -87,10 +87,12 @@ type connCore struct {
 	wsEmitFn func(seg []byte) error
 	wsCtrlFn func(op byte, payload []byte) error
 
-	// closing 可从任意 goroutine 置位（Close 幂等，第一个 reason 生效）。
-	closing atomic.Bool
-	mu      sync.Mutex // 只保护 reason
-	reason  error
+	// closing 是 out.mu 下置位的关闭标志的无锁副本（loop 线程快查用）；
+	// 真正的仲裁在 beginClose 里，与 reason 同一临界区。
+	closing   atomic.Bool
+	mu        sync.Mutex // 只保护 reason / reasonSet
+	reason    error
+	reasonSet bool
 
 	cb coreCallbacks
 
@@ -99,27 +101,46 @@ type connCore struct {
 	lnode lruNode // linger 链节点（Draining 期间；暂停中进入 Draining 时与 tnode 并存）
 }
 
-func (c *connCore) setReason(err error) {
-	c.mu.Lock()
-	if c.reason == nil {
-		c.reason = err
-	}
-	c.mu.Unlock()
-}
-
 func (c *connCore) closeReason() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.reason
 }
 
+// beginClose 是关闭的**唯一仲裁点**，也是 Close 的线性化点（06 线性化表）：
+// 在 outbound 的临界区内一次性完成「置 closing + 记录 reason」。
+//
+// 两条硬保证都由这个临界区兑现：
+//   - 「Close 返回之后 Send 一定报错」（01 D15）——Send 检查的就是 o.closing，
+//     它在 Close 返回前就已经置位，而不是等 loop 处理完控制项。
+//   - 「第一个 reason 生效」——CAS 与 reason 写入分离时，抢到 CAS 的那个
+//     可能被抢占，让 CAS 失败的那个先写进 reason，胜负颠倒。
+//
+// 返回 true 表示本次调用是第一个关闭者，由它负责推进 Draining。
+func (c *connCore) beginClose(reason error) bool {
+	o := c.out
+	o.mu.Lock()
+	if o.closing {
+		o.mu.Unlock()
+		return false
+	}
+	o.closing = true
+	c.mu.Lock()
+	c.reason = reason
+	c.reasonSet = true // nil 也是合法 reason：记下「已定」，后来者不得替换
+	c.mu.Unlock()
+	o.mu.Unlock()
+	c.closing.Store(true) // 供 loop 线程无锁快查
+	return true
+}
+
 // requestClose 是任意 goroutine 可调的关闭入口（公开 Close 的落点）。
-// 幂等；进入 Draining 的实际动作经收件箱回到 loop 线程。
+// 幂等；返回时 Send 已经一律 ErrConnClosed，进入 Draining 的实际动作
+// 经收件箱回到 loop 线程。
 func (c *connCore) requestClose(reason error) {
-	if !c.closing.CompareAndSwap(false, true) {
+	if !c.beginClose(reason) {
 		return
 	}
-	c.setReason(reason)
 	l := c.loop
 	l.box.push(func() { l.enterDraining(c) })
 	l.wk.maybeNotify()
@@ -127,11 +148,9 @@ func (c *connCore) requestClose(reason error) {
 
 // closeLocal 是 loop 线程上的关闭入口（协议错误、超时、写失败……）。
 func (l *loop) closeLocal(c *connCore, reason error) {
-	if !c.closing.CompareAndSwap(false, true) {
-		c.setReason(reason) // 已在关闭中：只尝试补记原因（第一个生效）
-		return
+	if !c.beginClose(reason) {
+		return // 已有关闭者，且它的 reason 已经定了
 	}
-	c.setReason(reason)
 	l.enterDraining(c)
 }
 

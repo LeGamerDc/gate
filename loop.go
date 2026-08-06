@@ -192,7 +192,8 @@ func (l *loop) attach(fd int, cb coreCallbacks) (*connCore, error) {
 	c.cdc = serverCodec(l.cfg.out.maxMessage)
 	c.out = newOutbound(l.cfg.out, l.io, fd, l.env, l)
 	c.out.owner = c
-	c.out.fatal = func(err error) { l.closeLocal(c, err) }
+	// 写/编码失败：仲裁已在 failLoop 里完成，这里只推进状态机（幂等）。
+	c.out.fatal = func(err error) { l.enterDraining(c) }
 	c.out.onPanic = func(err error) { c.requestClose(err) }
 	c.out.progress = func() {
 		if c.snode.inList() {
@@ -653,12 +654,26 @@ func (l *loop) enterDraining(c *connCore) {
 	if c.state >= stateDraining {
 		return
 	}
+	// 到这里 closing 一定已由 beginClose 置位（两个关闭入口都先仲裁）。
+	// 极少数直达路径（Shutdown 的 ctx 强拆）没走仲裁，这里补一次。
+	if !c.closing.Load() {
+		c.beginClose(ErrServerClosed)
+	}
 	prev := c.state
 	reason := c.closeReason()
-	if c.cb.onDrain != nil && prev == stateOpen {
-		c.cb.onDrain(reason) // M5：WS close 帧在 closeSend 之前排进出站链尾
+	// 帧流已有洞（写失败/编码失败）⇒ 不发 close 帧、不再尝试任何写，
+	// 直接拆除（05「本地主动关闭」的最后一行）。
+	if c.out.wireBroken {
+		c.state = stateDraining
+		l.idleLRU.remove(&c.tnode)
+		l.hsLRU.remove(&c.tnode)
+		l.detach(c)
+		return
 	}
-	c.out.closeSend()
+	if c.cb.onDrain != nil && prev == stateOpen {
+		// closing 已置位：close 帧走 force 路径追加，FIFO 保证它在最后（W13）。
+		c.cb.onDrain(reason)
+	}
 	c.state = stateDraining
 	l.idleLRU.remove(&c.tnode)
 	l.hsLRU.remove(&c.tnode)

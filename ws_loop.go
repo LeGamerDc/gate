@@ -32,7 +32,9 @@ func wsOnDrain(c *connCore) func(error) {
 		if !ok {
 			return // 背压/写失败/对端已断：直接关 TCP
 		}
-		if c.out.sendRaw(wsCloseFrame(code, "")) == nil {
+		// force：此刻 closing 已由 beginClose 置位，业务数据再也进不来，
+		// 所以这一帧结构上必然是 FIFO 的最后一段（W13）。
+		if c.out.sendRaw(wsCloseFrame(code, ""), true) == nil {
 			w.closeSent = true
 		}
 	}
@@ -132,7 +134,9 @@ func (l *loop) wsCtrl(c *connCore, op byte, payload []byte) error {
 	w := c.ws
 	switch op {
 	case wsOpPing:
-		_ = c.out.sendRaw(wsControlFrame(wsOpPong, payload)) // 关闭中失败就算了
+		// pong 走正常准入：ping 洪水下 pong 被 ErrSendQueueFull 挡掉即可，
+		// 不值得为它突破 MaxBuffer（对端本来就没在读）。
+		_ = c.out.sendRaw(wsControlFrame(wsOpPong, payload), false)
 	case wsOpPong:
 		// 我们不主动 ping；对端的 pong 忽略。
 	case wsOpClose:
@@ -149,7 +153,7 @@ func (l *loop) wsCtrl(c *connCore, op byte, payload []byte) error {
 			} else {
 				frame = wsCloseFrame(code, "")
 			}
-			if c.out.sendRaw(frame) == nil {
+			if c.out.sendRaw(frame, false) == nil {
 				w.closeSent = true
 			}
 		}

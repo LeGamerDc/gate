@@ -125,6 +125,9 @@ type outbound struct {
 	head, tail  *chunk
 	stage2Bytes int
 	encCipher   Cipher // 编码流推进到的 cipher epoch
+	// wireBroken：写失败或编码失败之后置位。帧流已经有洞，此后一个字节
+	// 都不该再写出去——连 WS close 帧也不行（05：写失败不发 close 帧）。
+	wireBroken bool
 
 	cfg      outConfig
 	io       connIO
@@ -302,11 +305,22 @@ func safeFill(fill func([]byte) (int, error), buf []byte) (k int, err error) {
 
 // sendRaw 入队一段已是最终线路字节的原始数据（loop 线程或握手路径调用；
 // 复制入池）。charge 精确等于长度，无 slack——它不参与任何封装。
-func (o *outbound) sendRaw(b []byte) error {
+//
+// force = true 用于**关闭已仲裁之后**追加的收尾帧（WS close 帧）：此刻
+// closing 已置位，业务数据再也进不来，所以强行追加的这一段结构上必然是
+// FIFO 的最后一段——close 帧绝不可能插进半个数据帧中间，也绝不可能被
+// 后来的数据帧越过（W13）。它同时豁免 MaxBuffer 准入：一个 ≤127 字节的
+// 收尾帧不值得为它放弃可解释的关闭码。
+func (o *outbound) sendRaw(b []byte, force bool) error {
 	o.mu.Lock()
-	if o.closing {
+	if o.closing && !force {
 		o.mu.Unlock()
 		return ErrConnClosed
+	}
+	if !force && o.cfg.maxBuffer >= 0 && o.reservedWire+len(b) > o.cfg.maxBuffer {
+		o.mu.Unlock()
+		o.env.stats.sendQueueFull.Add(1)
+		return ErrSendQueueFull // 控制帧也吃准入：否则 ping 洪水可无限堆 pong
 	}
 	data := poolGet(len(b))
 	copy(data, b)
@@ -342,6 +356,8 @@ func (o *outbound) isWritable() bool {
 }
 
 // closeSend 置 closing：后续 Send 一律 ErrConnClosed，已入队消息保留待尽力排空。
+// 生产路径的关闭一律走 connCore.beginClose（它才是线性化点）；这里保留给
+// 没有 core 的单元测试直接使用。
 func (o *outbound) closeSend() {
 	o.mu.Lock()
 	o.closing = true
@@ -747,9 +763,18 @@ func (o *outbound) discard() {
 	o.head, o.tail, o.stage2Bytes = nil, nil, 0
 }
 
-// failLoop 是写/编码失败路径（O8）：先关 outbound（discard），再通知宿主关连接。
-// 并发的 Send 从 discard 起一律 ErrConnClosed，不可能往有洞的帧流里再写。
+// failLoop 是写/编码失败路径（O8）：**先**把 outbound 置成关闭并丢弃队列，
+// **再**通知宿主关连接。并发的 Send 从这一刻起一律 ErrConnClosed，
+// 不可能往一条已经有洞的帧流里再写。
+//
+// 顺序上的一个要点：关闭仲裁（记录 reason）必须发生在 discard 之前——
+// discard 直接把 closing 置为 true，之后再仲裁就抢不到「第一个关闭者」，
+// OnClose 会拿到一个 nil reason。
 func (o *outbound) failLoop(err error) {
+	o.wireBroken = true
+	if o.owner != nil {
+		o.owner.beginClose(err) // 仲裁：置 closing + 记 reason（已有关闭者则保持其 reason）
+	}
 	o.discard()
 	if o.fatal != nil {
 		o.fatal(err)
