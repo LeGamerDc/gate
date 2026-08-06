@@ -22,10 +22,12 @@ var (
 
 // 发送侧错误。见 01「发送 / 背压」。
 var (
-	ErrConnClosed      = errors.New("gate: connection closed")   // Close 之后的发送
-	ErrSendQueueFull   = errors.New("gate: send queue full")     // 积压达到 MaxBuffer，消息从未入队
-	ErrMessageTooLarge = errors.New("gate: message too large")   // frameSize(len+Overhead) > Limits.MaxMessage
-	ErrInvalidLength   = errors.New("gate: invalid fill length") // SendFunc 的 fill 返回 k < 0 或 k > n
+	ErrConnClosed      = errors.New("gate: connection closed")    // Close 之后的发送
+	ErrSendQueueFull   = errors.New("gate: send queue full")      // 积压达到 MaxBuffer，消息从未入队
+	ErrMessageTooLarge = errors.New("gate: message too large")    // frameSize(len+Overhead) > Limits.MaxMessage
+	ErrInvalidLength   = errors.New("gate: invalid fill length")  // SendFunc 的 fill 返回 k < 0 或 k > n
+	ErrAsyncBusy       = errors.New("gate: async task in flight") // 该连接已有一次 AsyncDo 在途
+	ErrCipherConflict  = errors.New("gate: cipher conflict")      // 对配了 Cipher 的连接调用 SendFrame
 )
 
 // 协议违规的具体错误值，都会被包进 ErrProtocol。见 02「错误分类」。
