@@ -64,6 +64,7 @@ type connCore struct {
 	cdc  codec  // 入站解析策略；requireEncrypt 随 cipher 即时切换
 	ciph Cipher // 入站解密（串行域内读写；出站走队列 barrier）
 	in   inboundState
+	ws   *wsState // 非 nil ⇒ WebSocket 传输：读事件先过 WS 帧层
 
 	// 读闸 / 异步（串行域）
 	pauseDepth   int

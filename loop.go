@@ -404,6 +404,11 @@ func (l *loop) connReadable(c *connCore) {
 	c.out.beginInLoop()
 	defer l.flushBatchEnd(c)
 
+	if c.ws != nil {
+		l.wsReadable(c) // WS：原始字节先过帧层，再进同一份 gate 帧循环（W1）
+		return
+	}
+
 	calls, bytes := 0, 0
 	for calls < readBudgetCalls && bytes < readBudgetBytes {
 		if c.state != stateOpen || c.pauseDepth > 0 || c.closing.Load() {
@@ -648,6 +653,9 @@ func (l *loop) detach(c *connCore) {
 	// 4. 丢弃 stage1/stage2，归还池内存，退还预算。
 	c.out.discard()
 	c.in.release()
+	if c.ws != nil {
+		c.ws.release()
+	}
 	// 5. 从五条 LRU 摘除；槽位置 nil；gen++。
 	l.idleLRU.remove(&c.tnode)
 	l.hsLRU.remove(&c.tnode)

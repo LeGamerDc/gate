@@ -26,6 +26,10 @@ const (
 	itemMessage itemKind = iota
 	itemFrame
 	itemCipherBarrier
+	// itemRaw：已是最终线路字节的原始段（WS 的 101 响应、HTTP 拒绝、控制帧），
+	// 绕过 gate 编码与 WS 封帧，但仍走同一条 FIFO——close 帧因此绝不可能
+	// 插进半个数据帧中间（W13 的结构性保证）。
+	itemRaw
 )
 
 // stage1Item：待编码队列的 tagged union（03「两级队列」）。
@@ -292,6 +296,24 @@ func safeFill(fill func([]byte) (int, error), buf []byte) (k int, err error) {
 	return fill(buf)
 }
 
+// sendRaw 入队一段已是最终线路字节的原始数据（loop 线程或握手路径调用；
+// 复制入池）。charge 精确等于长度，无 slack——它不参与任何封装。
+func (o *outbound) sendRaw(b []byte) error {
+	o.mu.Lock()
+	if o.closing {
+		o.mu.Unlock()
+		return ErrConnClosed
+	}
+	data := poolGet(len(b))
+	copy(data, b)
+	wake := o.enqueueLocked(stage1Item{kind: itemRaw, data: data}, len(b))
+	o.mu.Unlock()
+	if wake {
+		o.loop.maybeNotify()
+	}
+	return nil
+}
+
 // setCipher 往队尾追加 cipher barrier（03「SetCipher：队列里的 barrier」）。
 // 入站方向的即时切换由 session 层完成；这里只管出站 epoch。
 func (o *outbound) setCipher(ci Cipher) {
@@ -394,16 +416,51 @@ func (o *outbound) flush(clearArmed, clearInLoop bool) writeStatus {
 // 这里被逐帧调用，屏障一批一次而不是一帧一次。任何失败（含 panic）都在返回前
 // 释放已生成的 seg 与未消费的 items——之后由调用方走 failLoop。
 func (o *outbound) encodeItems(items []stage1Item) (err error) {
+	// out*：本批最终追加到 stage 2 的链；seg*：当前 gate 帧段落。
+	// 原始段（itemRaw）会结束当前段落——WS 封帧只包 gate 帧，101 响应与
+	// WS 控制帧原样出线，但仍在同一条 FIFO 上（W13）。
+	var outHead, outTail *chunk
+	outBytes := 0
 	var segHead, segTail *chunk
 	segBytes := 0
 	charged := 0
+
+	appendOut := func(head, tail *chunk, n int) {
+		if head == nil {
+			return
+		}
+		if outTail == nil {
+			outHead, outTail = head, tail
+		} else {
+			outTail.next = head
+			outTail = tail
+		}
+		outBytes += n
+	}
+	// closeSeg 结束当前 gate 段落：WS 模式下前插一个封帧头 chunk（O12/W7）。
+	closeSeg := func() {
+		if segHead == nil {
+			return
+		}
+		if o.cfg.wsWrap != nil {
+			h := o.env.slab.get()
+			h.kind = chunkInline
+			h.n = int32(o.cfg.wsWrap(segBytes, h.hdr[:]))
+			h.next = segHead
+			segHead = h
+			segBytes += int(h.n)
+		}
+		appendOut(segHead, segTail, segBytes)
+		segHead, segTail, segBytes = nil, nil, 0
+	}
 
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("%w: cipher/encode: %v", ErrHandlerPanic, r)
 		}
 		if err != nil {
-			for c := segHead; c != nil; {
+			closeSeg()
+			for c := outHead; c != nil; {
 				next := c.next
 				c.release()
 				o.env.slab.put(c)
@@ -433,6 +490,15 @@ func (o *outbound) encodeItems(items []stage1Item) (err error) {
 		case itemCipherBarrier:
 			// barrier：切换编码 epoch，并天然结束了任何 compound 分组（O13）。
 			o.encCipher = it.cipher
+			i++
+
+		case itemRaw:
+			charged += len(it.data)
+			closeSeg()
+			c := o.env.slab.get()
+			c.kind, c.buf, c.n = chunkPooled, it.data, int32(len(it.data))
+			appendOut(c, c, int(c.n))
+			items[i].data = nil
 			i++
 
 		case itemFrame:
@@ -473,28 +539,19 @@ func (o *outbound) encodeItems(items []stage1Item) (err error) {
 		}
 	}
 
-	// WS 封帧发生在编码时（O12）：帧头也是持久 chunk，长度 = seg 的总字节数。
-	if o.cfg.wsWrap != nil && segBytes > 0 {
-		h := o.env.slab.get()
-		h.kind = chunkInline
-		h.n = int32(o.cfg.wsWrap(segBytes, h.hdr[:]))
-		h.next = segHead
-		segHead = h
-		segBytes += int(h.n)
-	}
-
-	if segHead != nil {
+	closeSeg()
+	if outHead != nil {
 		if o.tail == nil {
-			o.head, o.tail = segHead, segTail
+			o.head, o.tail = outHead, outTail
 		} else {
-			o.tail.next = segHead
-			o.tail = segTail
+			o.tail.next = outHead
+			o.tail = outTail
 		}
-		o.stage2Bytes += segBytes
+		o.stage2Bytes += outBytes
 	}
 
 	// 编码退还（第一段）：此刻 WS 封帧已完成，线路字节精确可知（06 预算模型）。
-	if refund := charged - segBytes; refund != 0 {
+	if refund := charged - outBytes; refund != 0 {
 		o.mu.Lock()
 		o.reservedWire -= refund
 		o.mu.Unlock()
