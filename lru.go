@@ -54,8 +54,8 @@ func (l *lruList) remove(n *lruNode) {
 func (n *lruNode) inList() bool { return n.prev != nil }
 
 // touch 移到尾部并更新时刻（idle 交付消息 / stall 写出字节）。
+// pushBack 自己先摘再挂，这里不必再 remove 一次。
 func (l *lruList) touch(n *lruNode, when int64) {
-	l.remove(n)
 	l.pushBack(n, when)
 }
 

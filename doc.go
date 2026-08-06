@@ -36,7 +36,11 @@
 //   - Conn.State 只能在**串行域**内访问——OnOpen / OnMessage / OnClose /
 //     Post / AsyncDo 的函数体。不在串行域里就用 Post 排进去。
 //
-// SetCipher、Pause、AsyncDo 也只能在串行域内调用。
+// SetCipher / Pause / AsyncDo 的约束**比 State 窄一格**：只能在事件循环线程上
+// 调用——回调与 Post 的函数体，不含 AsyncDo 的函数体。它们要改的是 gate 自己的
+// 连接状态（cipher、读闸、LRU 归属、poller 注册），那些是循环私有的；而 AsyncDo
+// 的函数体虽然属于**业务状态**意义上的串行域，却跑在另一个 goroutine 上。
+// 在 AsyncDo 里需要它们时用 Post 排回去。
 //
 // # 两种传输，一份语义
 //

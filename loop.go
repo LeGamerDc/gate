@@ -736,7 +736,7 @@ func (l *loop) enterDraining(c *connCore) {
 		return
 	}
 	if st == writeIdle || l.cfg.linger == 0 {
-		l.detach(c) // 已排空，或 CloseLinger=0 表示立即关闭
+		l.detach(c) // 已排空，或 CloseLinger=Unlimited（归一化成 linger=0）：不等待
 		return
 	}
 	l.modInterest(c, interestWrite) // Draining：只有写（06 状态表）

@@ -128,7 +128,9 @@ func ExampleConn_SendFunc() {
 func ExampleConn_AsyncDo() {
 	var c *gate.Conn[*player]
 
-	// 只能在串行域内调用（回调 / Post / AsyncDo 的函数体）。
+	// 只能在事件循环线程上调用：回调与 Post 的函数体。
+	// **不能**在另一个 AsyncDo 的函数体里调——那跑在别的 goroutine 上，
+	// 而 AsyncDo 要碰读闸与 poller 注册。需要的话先 Post 排回去。
 	err := c.AsyncDo(func() {
 		// 这里可以安全地访问 c.State：gate 保证它与其余回调不重叠。
 		c.State.room = lookupRoomFromDB(c.State.id)

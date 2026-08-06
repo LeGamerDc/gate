@@ -29,7 +29,7 @@ type Outbound struct {
 	MaxBuffer         int           // 出站积压准入上限；0 用默认 1MB，Unlimited 关闭
 	HighWater         int           // 软上限，越过后 Writable() 返回 false；0 ⇒ MaxBuffer/4
 	StallTimeout      time.Duration // 积压非空且这么久没写出一个字节 ⇒ 关闭；0 用默认 30s，Unlimited 关闭
-	CloseLinger       time.Duration // Close 之后为排空出站队列最多再等多久；0 表示立即关闭
+	CloseLinger       time.Duration // Close 之后为排空出站队列最多再等多久；0 用默认 1s，Unlimited 表示不等待、立即关闭
 }
 
 // DefaultOutbound 返回推荐配置。是函数而非可变全局量——包级变量可以被任意一个
