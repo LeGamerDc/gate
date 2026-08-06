@@ -142,7 +142,7 @@ func (c *Conn[S]) Pause() (resume func())    // 低级原语：只暂停，不�
 
 // 其它
 func (c *Conn[S]) Close(reason error)        // reason 会原样传给 OnClose
-func (c *Conn[S]) SetCipher(Cipher)          // **只能在串行域内调用**；出站经队列 barrier 生效
+func (c *Conn[S]) SetCipher(Cipher)          // **只能在事件循环线程上调用**；出站经队列 barrier 生效
 func (c *Conn[S]) Handshake() *Handshake     // 非 WebSocket 返回 nil
 func (c *Conn[S]) Remote() netip.AddrPort
 func (c *Conn[S]) ID() uint64                // 进程内唯一且永不复用
@@ -860,8 +860,10 @@ func (c *Conn[S]) Post(f func(*Conn[S]))
   上限由 `Limits.MaxPending` 约束。
 - 可重入：多次 `Pause` 需要同样多次 `resume` 才恢复。
 - `resume` 幂等；在已关闭的连接上调用是 no-op。
-- `Pause` 只能在**串行域内**调用（与速查表一致）。从别的 goroutine 调用时
-  「单连接内串行」的保证不成立——事件循环可能已经越过了暂停检查。
+- `Pause` 只能在**事件循环线程上**调用（与速查表一致）：回调与 `Post` 的函数体，
+  **不含 `AsyncDo` 的函数体**。它要改读闸深度、LRU 归属与 poller 注册，这些是
+  loop 私有状态；从别的 goroutine 调用时「单连接内串行」的保证也不成立——
+  事件循环可能已经越过了暂停检查。在 `AsyncDo` 里需要它时用 `Post` 排回去。
 - **暂停期间不计入 `Limits.Idle` 的空闲时长**，`resume` 之后重新开始计时。
   否则一个跑 6 分钟 RPC 的 `AsyncDo` 会被 5 分钟的空闲判定干掉。
 - **但暂停本身有上限**：单次暂停超过 `Limits.MaxPause` 即关闭连接
@@ -1174,7 +1176,7 @@ type Cipher interface {
 	Open(dst, ciphertext, aad []byte) ([]byte, error)
 }
 
-c.SetCipher(myCipher)  // 只能在串行域内调用；nil 表示关闭加密
+c.SetCipher(myCipher)  // 只能在事件循环线程上调用；nil 表示关闭加密
 ```
 
 ### 契约
@@ -1215,27 +1217,38 @@ frameSize(len(data) + Overhead()) <= Limits.MaxMessage
 也就是说一条贴着 `MaxMessage` 的明文消息在配了 AEAD 之后会被 `Send` 拒绝
 （`ErrMessageTooLarge`），而不是编码到一半才发现越限。
 
-### `SetCipher`：串行域内调用，出站经队列 barrier 生效
+### `SetCipher`：事件循环线程上调用，出站经队列 barrier 生效
 
 密钥切换必须**在帧流里有一个确定的位置**——切换点之前的帧用旧密钥，之后的用新密钥，
 否则对端无从解密。它一次做两件事：
 
-- **入站**：cipher 是只在串行域内读写的普通字段，切换对下一个被解析的帧生效。
-  这就是「只能在串行域内调用」（回调、`Post`、`AsyncDo` 的函数体）的原因，
+- **入站**：cipher 是只在 loop 线程上读写的普通字段，切换对下一个被解析的帧生效。
+  这就是「只能在事件循环线程上调用」（回调与 `Post` 的函数体）的原因，
   顺带消掉一个原子指针。
+  **`AsyncDo` 的函数体不算**——它属于**业务状态**意义上的串行域，却跑在另一个
+  goroutine 上，而 cipher 是 loop 私有状态（见[线程模型速查](#线程模型速查)与
+  [06](06-connection-state-machine.md#入站串行域内的即时切换)）。
 - **出站**：往出站队列追加一个 **cipher barrier**。加密发生在 **flush 时**，不是
   入队时——初稿以为「在事件循环上调用」就足够了，但已入队未编码的消息照样会被
   新密钥追上（第二轮评审的 P0）。编码器遇到 barrier 才切换，并结束当前的 compound
   分组。见 [03](03-outbound.md#setcipher队列里的-barrier)。
 
-异步握手完成后换密钥的典型写法（`AsyncDo` 的函数体在串行域内，也可以直接调）：
+异步握手完成后换密钥的典型写法——**从 `AsyncDo` 里必须经 `Post` 排回 loop**，
+不能直接调：
 
 ```go
-c.Post(func(c *gate.Conn[*player]) {
-	c.SetCipher(negotiated)
-	_ = c.Send(handshakeDone)   // 这条以及之后的都用新密钥
+c.AsyncDo(func() {
+	negotiated := kdf(...)          // 慢活：在别的 goroutine 上做
+	c.Post(func(c *gate.Conn[*player]) {
+		c.SetCipher(negotiated)     // 回到 loop 线程才碰 cipher
+		_ = c.Send(handshakeDone)   // 这条以及之后的都用新密钥
+	})
 })
 ```
+
+在 `AsyncDo` 的函数体里直接 `c.SetCipher(...)` 是数据竞争：同一时刻 loop 可能正因
+超时、`Shutdown` 或写失败在执行拆除。gate 检测不到这类误用（Go 里没有可靠的
+「我在哪个 goroutine 上」），由 `-race` 兜底。
 
 ### 分配
 
@@ -1709,8 +1722,9 @@ batch 样本上实测 Fastest 比 Better 快 24% 且压缩率相同，而常驻�
 | 与当次回调的剩余部分 | 只登记，回调返回后才 `go f()` | 无（还省掉一次注定没用的 RPC） |
 | 与 `OnClose` | socket 立刻拆，`OnClose` 推迟到 `resume` 之后 | `Conn` 活得比 socket 长 |
 
-**跨回调的并发本来就不可能**——`AsyncDo` 只能在串行域内调用，而它一调用连接就暂停，
-不会再有新的 `OnMessage` 被投递。所以只需要处理「同一次回调里调两次」。
+**跨回调的并发本来就不可能**——`AsyncDo` 只能在事件循环线程上调用（回调与 `Post`
+的函数体），而它一调用连接就暂停，不会再有新的 `OnMessage` 被投递。所以只需要处理
+「同一次回调里调两次」。
 
 **代价。** `Conn` 与 `State` 活到 `f` 结束；`Shutdown` 不等待在途的 `AsyncDo`，
 那些连接的 `OnClose` 推迟触发甚至不触发（进程先退出时）。因此
@@ -1866,7 +1880,7 @@ gate 的传输层只有 TCP 和 WS 两种、编解码只有一种，为这点灵
 | `DefaultSenderBuilder` | `DefaultOutbound()` |
 | `Conn.SendNoEncrypt`（明文旁路） | `Conn.SendAlone`（**仍然加密**，见 D21） |
 | `Conn.SendStatic(data, compressed)` | `srv.NewFrame(data)` + `Conn.SendFrame`（GC 管理，无需释放） |
-| `Conn.UpdateCipher`（任意 goroutine） | `Conn.SetCipher`（**只能在串行域内**；出站经队列 barrier 生效，见 D25） |
+| `Conn.UpdateCipher`（任意 goroutine） | `Conn.SetCipher`（**只能在事件循环线程上**；出站经队列 barrier 生效，见 D25） |
 | `Conn.AsyncDo`（重入、并发语义未定义） | 保留并收紧：**拒绝重入**、回调返回后才启动、`OnClose` 推迟到 `resume` 之后 ⇒ 函数体属于串行域，**可以直接访问 `State`**（D18）。裸暂停另开 `Conn.Pause()`，不带此保证 |
 | `Conn.Close()` | `Conn.Close(reason)` |
 | `Conn.RemoteIp/RemotePort/Remote` | `Conn.Remote() netip.AddrPort` |

@@ -528,7 +528,8 @@ loop 处理 resume 控制项（串行域内）:
 
 `depth`、LRU、poller 注册都**只在 loop 线程上改**——初稿允许 `resume` 直接
 `mod(fd)`，与 R2「所有 syscall 在 loop 上」直接冲突，第二轮评审纠出。
-`Pause` 本身只能在串行域内调用（天然在 loop 上），可以直接改。
+`Pause` 本身只能在 **loop 线程上**调用（回调与 `Post` 的函数体，**不含 `AsyncDo`
+的函数体**——它跑在别的 goroutine 上），所以它可以直接改。
 
 `AsyncDo` 在这之上多加两条：**同一连接同时只允许一个在途任务**（第二次调用返回
 `ErrAsyncBusy`），且 **goroutine 在当次回调返回之后才启动**。这两条加上「`resume`

@@ -46,11 +46,13 @@ type Conn[S any] struct {
 }
 
 // bindConn 把泛型壳与非泛型核对接：回调闭包捕获壳与 handler。
+//
+// 整体赋值 core.cb 是安全的：coreCallbacks 里只有业务回调，传输层的钩子
+// （onDrain）是 connCore 的另一个字段，不会被这一句抹掉。
 func bindConn[S any](h Handler[S], core *connCore, id uint64, remote netip.AddrPort, hs *Handshake) *Conn[S] {
 	shell := &Conn[S]{id: id, remote: remote, hs: hs}
 	shell.core.Store(core)
 	core.cb = coreCallbacks{
-		onDrain: core.cb.onDrain, // 保留传输层已装的钩子（WS close 帧）
 		onOpen: func() error {
 			s, err := h.OnOpen(shell)
 			if err != nil {

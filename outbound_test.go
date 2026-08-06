@@ -8,6 +8,17 @@ import (
 	"testing"
 )
 
+// closeSend 只置 closing，不做仲裁、不记 reason。生产路径的关闭一律走
+// connCore.beginClose（它才是线性化点，见 06 线性化表），所以这个方法定义在
+// 测试文件里——它不该被编译进生产包，也就不可能有人在生产路径上顺手用它，
+// 把 reason 丢掉（那正是写失败路径上出现过的 bug）。
+// 给没有 core 的 outbound 单元测试用。
+func (o *outbound) closeSend() {
+	o.mu.Lock()
+	o.closing = true
+	o.mu.Unlock()
+}
+
 // afterOutbound 是资源配平断言（T-D5 的组件级形态）：写完之后
 // reservedWire == 0、stage 2 空、stage 1 空。
 func afterOutbound(t *testing.T, o *outbound) {

@@ -202,37 +202,22 @@ func (w *wsState) headerNeed() int {
 	return n
 }
 
-// beginFrame 在整头收齐后执行校验清单 2~10 步并进入 payload 阶段。
+// beginFrame 在整头收齐后执行校验清单 7~12 步并进入 payload 阶段。
 func (w *wsState) beginFrame() error {
+	// 2~6 在 feed 里读到第二个字节时就已经查过。这里**再调一次 checkEarly**
+	// 而不是抄一份：5/6 必须先于 7（控制帧的长度标记只要不是 7 位直写就已经
+	// > 125，读到第二个字节就能拒，不必先解扩展长度再报一个 non-canonical），
+	// 而校验顺序本身是规格的一部分——错误分类与拒绝时机都不同。两份实现里
+	// 漏改一处，顺序就悄悄变了，而不会有任何东西失败。
+	if err := w.checkEarly(); err != nil {
+		return err
+	}
 	b0, b1 := w.hdrBuf[0], w.hdrBuf[1]
 	fin := b0&wsFinBit != 0
 	op := b0 & 0x0F
 	masked := b1&wsMaskBit != 0
-
-	if b0&wsRsvMask != 0 { // 2. 我们不协商任何扩展
-		return errWSRsv
-	}
-	switch op {
-	case wsOpContinuation, wsOpBinary, wsOpClose, wsOpPing, wsOpPong:
-	case wsOpText: // 4. gate 的 payload 是二进制
-		return errWSText
-	default: // 3. 保留 opcode
-		return errWSOpcode
-	}
-
 	plen := int64(b1 & 0x7F)
 	isCtrl := op >= wsOpClose
-	// 5/6 先于 7：控制帧的长度标记只要不是 7 位直写就已经 > 125，
-	// 读到第二个字节就能拒——不必先去解扩展长度再报一个 non-canonical。
-	// 校验顺序本身是规格的一部分（错误分类与拒绝时机都不同）。
-	if isCtrl {
-		if plen > wsMaxCtrlPayload {
-			return errWSCtrlTooLong
-		}
-		if !fin {
-			return errWSCtrlFragment
-		}
-	}
 	off := 2
 	switch plen {
 	case 126:

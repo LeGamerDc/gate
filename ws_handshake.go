@@ -133,20 +133,7 @@ func (l *loop) wsHsReadable(c *connCore, opts *WebSocketOptions, done func(hs *H
 			if !l.readOK(c, n, err) {
 				return
 			}
-			// 累积进 carry（握手不是热路径，池间搬运可接受）。
-			if c.in.carry == nil {
-				c.in.carry = append(poolGet(n)[:0], l.rbuf[:n]...)
-			} else {
-				need := len(c.in.carry) + n
-				if cap(c.in.carry) >= need {
-					c.in.carry = append(c.in.carry, l.rbuf[:n]...)
-				} else {
-					nb := append(poolGet(need)[:0], c.in.carry...)
-					nb = append(nb, l.rbuf[:n]...)
-					poolPut(c.in.carry)
-					c.in.carry = nb
-				}
-			}
+			c.in.appendCarry(l.rbuf[:n]) // 握手期的上界是 maxHS，见下面的边界检查
 		}
 		data := c.in.carry
 		idx := bytes.Index(data, crlfcrlf)

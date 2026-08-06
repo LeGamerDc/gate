@@ -158,6 +158,25 @@ func (o *outbound) charge(payloadLen int, ci Cipher) int {
 	return frameSize(payloadLen+cipherOverhead(ci)) + o.cfg.wireSlack
 }
 
+// 记账三入口。配额侧有三种语义，但**账面只有一处**：
+//
+//	admitLocked      可拒绝：过 MaxBuffer + quota.acquire，失败即 ErrSendQueueFull
+//	forceChargeLocked 不可拒绝：已过准入的差额与收尾帧，quota.borrow
+//	refundLocked      归还：quota.release
+//
+// 三者曾经各写一份「reservedWire += / 统计 / 水位」，其中一份漏掉了水位
+// 同步——同一段记账抄三遍，分叉只是时间问题。accountLocked 是那唯一一处。
+
+// accountLocked 只记账，不碰配额。必须持有 o.mu。
+func (o *outbound) accountLocked(n int) {
+	if n == 0 {
+		return
+	}
+	o.reservedWire += n
+	o.env.stats.outboundQueued.Add(int64(n))
+	o.syncWaterLocked()
+}
+
 // admitLocked 是入队前的两道准入：每连接的 MaxBuffer 与全局的
 // MaxOutboundBytes（loop 配额租约）。通过时已完成扣减，调用方负责入队。
 // 必须持有 o.mu。
@@ -168,10 +187,20 @@ func (o *outbound) admitLocked(charge int) bool {
 	if !o.env.quota.acquire(charge) {
 		return false // 全局预算耗尽：同样是准入拒绝，帧流没有洞
 	}
-	o.reservedWire += charge
-	o.env.stats.outboundQueued.Add(int64(charge))
-	o.syncWaterLocked()
+	o.accountLocked(charge)
 	return true
+}
+
+// forceChargeLocked 是**不可拒绝**的扣减：收尾帧（close）与 SendFunc commit
+// 时因 cipher epoch 变化产生的差额，都已经过了准入，不能再退回去。
+// borrow 与 refundLocked 的 release 严格对称——只记账不扣配额的话，
+// 之后的 release 会凭空造出额度，MaxOutboundBytes 就此失守。必须持有 o.mu。
+func (o *outbound) forceChargeLocked(n int) {
+	if n == 0 {
+		return
+	}
+	o.env.quota.borrow(n)
+	o.accountLocked(n)
 }
 
 // syncWaterLocked 维护 ConnsOverHighWater：水位穿越是边沿事件，
@@ -189,16 +218,14 @@ func (o *outbound) syncWaterLocked() {
 	}
 }
 
-// refund 退还 n 字节（编码退还、写出退还、abort、discard 都走这里），
+// refundLocked 退还 n 字节（编码退还、写出退还、abort、discard 都走这里），
 // 保证 reservedWire 与配额租约永远同步。必须持有 o.mu。
 func (o *outbound) refundLocked(n int) {
 	if n == 0 {
 		return
 	}
-	o.reservedWire -= n
-	o.env.stats.outboundQueued.Add(int64(-n))
 	o.env.quota.release(n)
-	o.syncWaterLocked()
+	o.accountLocked(-n)
 }
 
 // enqueueLocked 完成入队与 arm，返回是否需要锁外唤醒。
@@ -345,10 +372,7 @@ func (o *outbound) sendFunc(n int, fill func([]byte) (int, error)) error {
 		return ErrSendQueueFull
 	}
 	if delta := charge - reserved; delta > 0 {
-		o.reservedWire += delta
-		o.env.stats.outboundQueued.Add(int64(delta))
-		o.env.quota.borrow(delta) // 已过准入的消息不再拒绝，但账要对称
-		o.syncWaterLocked()
+		o.forceChargeLocked(delta) // 已过准入的消息不再拒绝，但账要对称
 	} else {
 		o.refundLocked(-delta)
 	}
@@ -387,12 +411,7 @@ func (o *outbound) sendRaw(b []byte, force bool) error {
 		return ErrConnClosed
 	}
 	if force {
-		// 收尾帧豁免准入，但账要平：borrow 是不可拒绝的扣减，
-		// 与后续的 release 严格对称（acquire 的返回值被忽略时，
-		// release 会凭空造出额度）。
-		o.reservedWire += len(b)
-		o.env.stats.outboundQueued.Add(int64(len(b)))
-		o.env.quota.borrow(len(b))
+		o.forceChargeLocked(len(b)) // 豁免准入，但账要平
 	} else if !o.admitLocked(len(b)) {
 		o.mu.Unlock()
 		o.env.stats.sendQueueFull.Add(1)
@@ -429,15 +448,6 @@ func (o *outbound) isWritable() bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return !o.closing && (o.cfg.highWater <= 0 || o.reservedWire <= o.cfg.highWater)
-}
-
-// closeSend 置 closing：后续 Send 一律 ErrConnClosed，已入队消息保留待尽力排空。
-// 生产路径的关闭一律走 connCore.beginClose（它才是线性化点）；这里保留给
-// 没有 core 的单元测试直接使用。
-func (o *outbound) closeSend() {
-	o.mu.Lock()
-	o.closing = true
-	o.mu.Unlock()
 }
 
 func (o *outbound) setFlushable(v bool) {
@@ -683,7 +693,7 @@ func (o *outbound) encodeSingle(it stage1Item, charged *int, e *encCtx) error {
 	}
 	tryCompress := it.maskPermit&flagZ != 0 && it.maskAlready == 0 &&
 		o.cfg.compressThreshold > 0 && len(it.data) > o.cfg.compressThreshold
-	bf, err := buildFrameAAD(it.data, it.maskAlready, o.encoderIf(tryCompress), tryCompress, ci, maxMessageSize, &o.env.aadHdr)
+	bf, err := o.buildFrame(it.data, it.maskAlready, ci, tryCompress)
 	if err != nil {
 		return err
 	}
@@ -706,7 +716,7 @@ func (o *outbound) encodeCompound(group []stage1Item, size int, charged *int, e 
 	}
 	// 02：compound 按整批字节数与阈值比较（>=）。
 	tryCompress := o.cfg.compressThreshold > 0 && size >= o.cfg.compressThreshold
-	bf, err := buildFrameAAD(body, flagC, o.encoderIf(tryCompress), tryCompress, o.encCipher, maxMessageSize, &o.env.aadHdr)
+	bf, err := o.buildFrame(body, flagC, o.encCipher, tryCompress)
 	if err != nil {
 		poolPut(body)
 		return err
@@ -723,6 +733,14 @@ func (o *outbound) encoderIf(need bool) *zstd.Encoder {
 		return nil
 	}
 	return o.env.encoder()
+}
+
+// buildFrame 把编码需要而调用点不关心的三样东西收在一处：loop 私有的 AAD
+// 暂存（见 buildFrameInto 的说明——它是逃逸分析的必需品，不该在每个调用点
+// 复述一遍）、懒初始化的 zstd 编码器、协议线路上限。调用点只说「编什么」。
+func (o *outbound) buildFrame(data []byte, flags byte, ci Cipher, tryCompress bool) (builtFrame, error) {
+	return buildFrameInto(&o.env.aadHdr, data, flags,
+		o.encoderIf(tryCompress), tryCompress, ci, maxMessageSize)
 }
 
 // pushFrameChunks 把 builtFrame 落成 inline(帧头) + pooled(body) 两个 chunk。

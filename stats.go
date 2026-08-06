@@ -10,10 +10,12 @@ import (
 // MessagesOut/FramesOut（合包聚合度）。
 type Stats struct {
 	// 连接
-	ConnsOpen          int64  // 当前
-	ConnsHandshaking   int64  // 当前处于握手阶段（WebSocket / PROXY）
-	ConnsPaused        int64  // 当前被 Pause
-	ConnsOverHighWater int64  // 当前 Writable() == false（未逐条采样，读取时为 0）
+	ConnsOpen        int64 // 当前
+	ConnsHandshaking int64 // 当前处于握手阶段（WebSocket / PROXY）
+	ConnsPaused      int64 // 当前被 Pause
+	// ConnsOverHighWater 是当前 Writable() == false 的连接数。它按**水位穿越**
+	// 的边沿维护（进出各记一次），不是读取时逐条采样——10 万连接下采样太贵。
+	ConnsOverHighWater int64
 	ConnsAccepted      uint64 // 累计
 	ConnsRejected      uint64
 

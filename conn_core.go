@@ -21,12 +21,18 @@ const (
 
 // coreCallbacks 是泛型壳（Conn[S] / Handler[S]）与非泛型核之间的桥。
 // 闭包由装配层绑定，捕获壳与 handler；测试直接给普通函数。
+//
+// 这里**只放业务回调**。传输层自己的钩子（onDrain）是 connCore 的独立字段：
+// 两者的安装者与安装时机都不同——业务回调在 bindConn（attach 时）整体赋值，
+// 传输钩子在 enableWS（握手接受后）单独安装。曾经把它们放在同一个结构体里，
+// 于是后到的 `c.cb = coreCallbacks{...}` 把先装好的 onDrain 整个抹掉，
+// WS close 帧再也发不出去。靠「记得在赋值时把那个字段抄过来」维持的不变式
+// 会在下一次加钩子时原样复发，所以按所有者拆开放。
 type coreCallbacks struct {
 	onOpen    func() error       // 进入 Open。返回 error ⇒ 拒绝连接，不配对 onClose
 	onMessage func([]byte) error // msg 仅本次调用有效
 	onClose   func(error)        // 恰好一次，且只与成功的 onOpen 配对
 	detach    func()             // 壳的 core 指针置 nil（Draining→Detached 第 2 步）
-	onDrain   func(error)        // 进入 Draining 时的钩子（M5：WS close 帧入队）；可为 nil
 }
 
 // inboundState 是入站增量状态机的每连接部分（06「入站的精确模型」）。
@@ -35,6 +41,31 @@ type inboundState struct {
 	body  []byte // 大帧目标缓冲（分级池，含帧头），非 nil 即处于大帧直读中
 	got   int    // body 已填充字节数
 	acct  int    // 已计入 Stats.PendingInbound 的字节数
+}
+
+// appendCarry 把 seg 追加到 carry 尾部（容量不够时按翻倍换一块更大的）。
+// 这是 carry 缓冲的**唯一**写入口——曾经有两个：一个追加、一个直接
+// `in.carry = buf` 覆盖。后者只在「此刻 carry 必为 nil」时才不漏内存，
+// 而那个前提由三条调用链各自维持、没有任何东西检查它。统一成追加之后，
+// 前提成立时行为不变（追加到 nil 就是赋值），不成立时也不再漏。
+//
+// 摊还 O(1)：与「每段都把整个 carry 重新合并一遍」相对，后者在投递预算
+// 耗尽后退化成 O(n²)——攻击者用大量 1 字节 WS 分片就能把它放大成几百 GB
+// 的内存复制（内存有 MaxPending 封顶，CPU 没有）。
+func (in *inboundState) appendCarry(seg []byte) {
+	switch {
+	case len(seg) == 0:
+	case in.carry == nil:
+		in.carry = append(poolGet(len(seg))[:0], seg...)
+	case cap(in.carry) >= len(in.carry)+len(seg):
+		in.carry = append(in.carry, seg...)
+	default:
+		grow := max(2*cap(in.carry), len(in.carry)+len(seg))
+		nb := append(poolGet(grow)[:0], in.carry...)
+		nb = append(nb, seg...)
+		poolPut(in.carry)
+		in.carry = nb
+	}
 }
 
 // syncPending 把「已读出未投递」的字节数同步进统计（增量口径）。
@@ -105,12 +136,14 @@ type connCore struct {
 
 	// closing 是 out.mu 下置位的关闭标志的无锁副本（loop 线程快查用）；
 	// 真正的仲裁在 beginClose 里，与 reason 同一临界区。
-	closing   atomic.Bool
-	mu        sync.Mutex // 只保护 reason / reasonSet
-	reason    error
-	reasonSet bool
+	closing atomic.Bool
+	mu      sync.Mutex // 只保护 reason
+	reason  error
 
 	cb coreCallbacks
+	// onDrain 是传输层在进入 Draining 时的钩子（WS：把 close 帧排进链尾）。
+	// 见 coreCallbacks 的说明：它不属于业务回调，所以不在那个结构体里。
+	onDrain func(error)
 
 	tnode lruNode // 状态链节点：idle / handshake / pause（按状态互斥）
 	snode lruNode // stall 链节点（WriteBlocked 期间）
@@ -132,6 +165,10 @@ func (c *connCore) closeReason() error {
 //   - 「第一个 reason 生效」——CAS 与 reason 写入分离时，抢到 CAS 的那个
 //     可能被抢占，让 CAS 失败的那个先写进 reason，胜负颠倒。
 //
+// 「第一个 reason 生效」不需要一个额外的「已定」标志：nil 也是合法 reason，
+// 但后来者根本走不到写入那一步——o.closing 的检查与写入在同一个临界区里，
+// 拿不到就直接返回 false。
+//
 // 返回 true 表示本次调用是第一个关闭者，由它负责推进 Draining。
 func (c *connCore) beginClose(reason error) bool {
 	o := c.out
@@ -143,7 +180,6 @@ func (c *connCore) beginClose(reason error) bool {
 	o.closing = true
 	c.mu.Lock()
 	c.reason = reason
-	c.reasonSet = true // nil 也是合法 reason：记下「已定」，后来者不得替换
 	c.mu.Unlock()
 	o.mu.Unlock()
 	c.closing.Store(true) // 供 loop 线程无锁快查
@@ -357,23 +393,30 @@ func (l *loop) cancelAsync(c *connCore) {
 	l.resumeOnLoop(c) // 撤销 asyncDo 里那次 pause
 }
 
-// runSafe 在恢复屏障内执行串行域闭包；panic ⇒ 关连接（ErrHandlerPanic）。
-// AsyncDo 的 goroutine 在**当次回调成功返回之后**启动；panic 出口按 01 D18
-// 取消注册而不是启动。
+// callbackBarrier 是**每一个回调出口**的统一收尾，必须写成
+// `defer l.callbackBarrier(c)`——recover 只在被 defer 直接调用的函数里生效。
+//
+// 它一次管两件事，而这两件事必须由同一个判断分流，否则就会分叉：
+//   - 恢复屏障：业务 panic 只关这一条连接（README 约束 4）。
+//   - AsyncDo 的启动 / 取消点：正常返回 ⇒ 启动已注册的任务；panic（连接要关）
+//     ⇒ 取消它，不做一次注定没用的 RPC（01 D18）。
+//
+// 三处曾经各写一份：入站批（connReadable）、carry 续投（processCarry）、
+// 串行域闭包（runSafe），其中一份还用一个多余的 panicked 布尔重新编码了
+// `r != nil` 已经给出的信息。回调出口的规则只该有一处定义。
+func (l *loop) callbackBarrier(c *connCore) {
+	if r := recover(); r != nil {
+		l.closeLocal(c, fmt.Errorf("%w: %v", ErrHandlerPanic, r))
+		l.cancelAsync(c)
+		return
+	}
+	l.launchAsync(c)
+}
+
+// runSafe 在恢复屏障内执行串行域闭包（Post 的函数体）。
 func (l *loop) runSafe(c *connCore, fn func()) {
-	panicked := true
-	defer func() {
-		if r := recover(); r != nil {
-			l.closeLocal(c, fmt.Errorf("%w: %v", ErrHandlerPanic, r))
-		}
-		if panicked {
-			l.cancelAsync(c)
-		} else {
-			l.launchAsync(c)
-		}
-	}()
+	defer l.callbackBarrier(c)
 	fn()
-	panicked = false
 }
 
 // currentInterest 按状态与子状态推导应有的兴趣集合。

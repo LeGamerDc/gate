@@ -14,14 +14,16 @@ var errWSStop = errors.New("gate/ws: stop feeding")
 // enableWS 把连接切到 WebSocket 模式（握手接受后调用；测试直接调）。
 func enableWS(c *connCore) {
 	c.ws = &wsState{}
-	c.cb.onDrain = wsOnDrain(c)
+	c.onDrain = wsOnDrain(c)
 	l := c.loop
 	c.wsEmitFn = func(seg []byte) error { return l.wsGateFeed(c, seg) }
 	c.wsCtrlFn = func(op byte, payload []byte) error { return l.wsCtrl(c, op, payload) }
 }
 
 // wsOnDrain 是进入 Draining 时的钩子：按 reason 决定发不发 close 帧（W10）。
-// 在 closeSend 之前被调用，close 帧因此还能排进出站链尾。
+// 调用时 closing **已经**由 beginClose 置位——顺序是反过来的，且必须反过来：
+// 先关闭再回帧，业务数据才进不来，close 帧才可能是 FIFO 的最后一段。
+// 它靠 sendRaw 的 force 路径豁免这道闸（见下）。
 func wsOnDrain(c *connCore) func(error) {
 	return func(reason error) {
 		w := c.ws
@@ -122,25 +124,20 @@ func (l *loop) wsGateFeed(c *connCore, seg []byte) error {
 	// WS 分片就能把它放大成 O(n²) 的内存复制（内存有 MaxPending 封顶，
 	// CPU 没有）。carry 的续投交给下一轮的 processCarry。
 	if c.pauseDepth > 0 || c.delivered >= deliverBudget {
-		l.appendCarry(c, seg)
+		l.stashCarry(c, seg, true)
 		l.queueCarry(c)
 		l.truncated = true
 		return nil
 	}
 
+	// gate 残片拼接（对应 TCP 路径的「carry 拷回 rbuf 头部」）：先把 seg 追加
+	// 进 carry，再把整块摘下来就地解析。增长策略复用 appendCarry——这里曾经
+	// 另写一份 merge，两份实现在「容量够就原地 append」这一条上是会分叉的。
 	data := seg
 	var merged []byte
 	if c.in.carry != nil {
-		// gate 残片拼接（对应 TCP 路径的「carry 拷回 rbuf 头部」）。
-		need := len(c.in.carry) + len(seg)
-		if cap(c.in.carry) >= need {
-			merged = append(c.in.carry, seg...)
-		} else {
-			merged = append(poolGet(need)[:0], c.in.carry...)
-			merged = append(merged, seg...)
-			poolPut(c.in.carry)
-		}
-		c.in.carry = nil
+		c.in.appendCarry(seg)
+		merged, c.in.carry = c.in.carry, nil
 		c.in.syncPending(l.stats)
 		data = merged
 	}

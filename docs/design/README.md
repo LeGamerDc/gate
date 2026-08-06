@@ -122,6 +122,29 @@ WebSocket 的封帧挂在出站的最后一跳，而三者对「谁维护残片�
 | 06 | 线性化点总表只写了 `Close` 的位置，没写「拆成两步就失效」；`carry ≤ rbuf` 只在 TCP 路径成立；`MaxPending` 管的不只是暂停；投递预算必须按「轮」且连接级 |
 | 01 / 06 | 「串行域」在两个层面上范围不同：对**业务状态**它含 `AsyncDo` 的函数体，对 **gate 自己的连接状态**（cipher、读闸、LRU、poller 注册）不含——后者必须在事件循环线程上。原文把两者混为一谈，等于允许从另一个 goroutine 改 loop 私有状态 |
 
+### 修完之后的一轮设计复查
+
+修 bug 会留下修 bug 的形状。两轮评审结束后又做了一遍**只看设计质量、不找新
+bug** 的复查，判据是这套文档一贯的那条：**靠纪律维持的不变式要变成结构上
+不可违反的**。改掉的都是「修好了，但把不变式换成了一句注释」的地方：
+
+| 退化 | 它会在哪一次修改上变成真 bug | 重新设计成 |
+| --- | --- | --- |
+| `onDrain` 与业务回调同处 `coreCallbacks`，靠 `bindConn` 里手抄一行保住 | 下一次加传输层钩子 | 按所有者拆开：`onDrain` 是 `connCore` 的独立字段，整体赋值抹不掉它 |
+| carry 缓冲的增长逻辑抄了四份（TCP／WS／PROXY／WS 握手），其中两份已经分叉，一份是「直接覆盖」——只在「此刻 carry 必为 nil」时才不漏内存 | 任何一次让 carry 在解析前非空的改动 | 唯一入口 `inboundState.appendCarry`：追加到 nil 就是赋值，前提不成立时也不漏 |
+| 出站记账（`reservedWire` / 统计 / 水位）抄了三份，收尾帧那份漏了水位同步 | 下一次加计数或改水位口径 | `accountLocked` 一处记账，配额侧分 `admitLocked`（可拒绝）／`forceChargeLocked`（不可拒绝）／`refundLocked` |
+| 回调出口的「恢复屏障 + AsyncDo 启动/取消」抄了三份，其中一份用一个多余的 `panicked` 布尔重新编码 `recover() != nil` | 下一次调整 D18 的启动/取消规则 | `defer l.callbackBarrier(c)`，规则只有一处定义 |
+| WS 校验清单 2~6 步在 `checkEarly` 与 `beginFrame` 各有一份 | 下一次加校验项——顺序会悄悄变，而顺序是规格 | `beginFrame` 调 `checkEarly`，不抄 |
+| `MaxConns` / `MaxHandshaking` 的原子占位写成 `limit > 0 && n.Add(1) > limit ... else if limit <= 0 { n.Add(1) }`：正确性押在短路求值上 | 任何一次「顺手理顺」这个条件 | `reserveSlot(n, limit)` |
+| `detach` 里 `pauseLRU` 被直接 `remove` 一次，而链表归属与 `ConnsPaused` 计数本该由 `enterPaused`/`exitPaused` 成对结清 | 下一次改暂停计数 | 只留 `exitPaused` 一个出口 |
+| `reasonSet` 写而不读（真正兑现「第一个 reason 生效」的是 `beginClose` 的临界区）；`closeSend` 只给测试用却编译进生产包 | 有人照着 `reasonSet` 的注释去判断「reason 已定」；有人在生产路径上顺手用 `closeSend`，丢掉 reason | 删；`closeSend` 移进 `_test.go` |
+| `buildFrameAAD` 与 `buildFrame` 一对双胞胎，逃逸分析的绕法出现在每个调用点 | —（可读性） | 实现只剩 `buildFrameInto`，热路径走 `outbound.buildFrame` |
+
+同一轮还扫掉了几处**与代码说反的注释**——它们比没有注释更糟，因为下一次修复会
+照着它们走。最严重的一处在 01：`SetCipher` 的详解一节仍写着「`AsyncDo` 的函数体
+也可以直接调」，还配了一段示例代码——那正是上一条勘误刚否掉的用法。勘误只改了
+速查表，没有扫全文。
+
 实现层面记录在案的规格偏离（均有代码注释说明理由）：
 
 - kqueue 的 token 不走 `udata` 而走 fd 索引表——Go 的精确 GC 不允许把非指针值

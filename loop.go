@@ -54,8 +54,8 @@ func normalizeLoopConfig(ob Outbound, li Limits, ws bool) loopConfig {
 		cfg.stall = 0 // Unlimited：禁用
 	}
 	// CloseLinger：零值 → 默认 1s（保护性选项零值=默认）；Unlimited → 立即关闭
-	// （linger 的「保护」是给排空封顶，关掉上限即不等待）。01 的表述有歧义
-	// （零值列写 1s、说明列写「0 表示立即」），按零值=默认解释，待回改文档。
+	// （linger 的「保护」是给排空封顶，关掉上限即不等待）。01 原先的表述自相
+	// 矛盾（零值列写 1s、说明列写「0 表示立即」），已按这里的解释回改。
 	switch {
 	case ob.CloseLinger == 0:
 		cfg.linger = int64(time.Second)
@@ -265,14 +265,15 @@ func (l *loop) openConn(c *connCore) {
 
 	var openErr error
 	func() {
-		// AsyncDo 的启动点在 defer 里：OnOpen 返回 error 或 panic 时，
-		// 已注册的任务同样必须启动，否则它会永久悬空。
+		// 这里不能直接用 callbackBarrier：它按「是否 panic」分流，而 OnOpen
+		// **返回 error** 同样意味着连接要关，也该取消已注册的 AsyncDo。
+		// 判据是 openErr，两条出口合并到它上面。
 		defer func() {
 			if r := recover(); r != nil {
 				openErr = fmt.Errorf("%w: OnOpen: %v", ErrHandlerPanic, r)
 			}
 			if openErr != nil {
-				l.cancelAsync(c) // 连接要关：不启动已注册的任务（01 D18）
+				l.cancelAsync(c) // 连接要关：不启动那次注定没用的 RPC（01 D18）
 			} else {
 				l.launchAsync(c)
 			}
@@ -479,14 +480,7 @@ func (l *loop) syncInterest(c *connCore) {
 // connReadable 处理一次读事件。恢复屏障在批边界：OnMessage / Cipher.Open 的
 // panic 只关这一条连接（01「panic 屏障放在批边界」）。
 func (l *loop) connReadable(c *connCore) {
-	defer func() {
-		if r := recover(); r != nil {
-			l.closeLocal(c, fmt.Errorf("%w: %v", ErrHandlerPanic, r))
-			l.cancelAsync(c) // 连接要关：不启动已注册的任务（01 D18）
-			return
-		}
-		l.launchAsync(c) // 正常出口的兜底（gateSink 已处理逐条的情形）
-	}()
+	defer l.callbackBarrier(c)
 	if c.state != stateOpen {
 		if l.onHsRead != nil && (c.state == stateProxy || c.state == stateHandshaking) {
 			l.onHsRead(c)
@@ -583,8 +577,9 @@ func (l *loop) parseAndDeliver(c *connCore, data []byte) bool {
 			l.stashCarry(c, data, true)
 			return false
 		}
-		// 预算是**每读事件**的连接级计数：WS 下一个读事件会被切成很多段
-		// emit，用局部计数会被每段重置，公平预算形同虚设。
+		// 预算是**每轮迭代**的连接级计数（startDeliverBudget 按 tick 重置）：
+		// WS 下一个读事件会被切成很多段 emit、carry 续投又是同一轮里的另一个
+		// 阶段，用局部计数会被每段重置，公平预算形同虚设。
 		if c.delivered >= deliverBudget {
 			l.stashCarry(c, data, true)
 			l.queueCarry(c)
@@ -649,42 +644,16 @@ func (l *loop) deliverFrameBuf(c *connCore, body []byte) {
 	}
 }
 
-// appendCarry 把 seg 追加到 carry 尾部（容量不够时按翻倍换一块更大的），
-// 并施加 MaxPending 封顶。摊还 O(1)——与「每次重新合并整段」相对，
-// 后者在预算耗尽后会退化成 O(n²)。
-func (l *loop) appendCarry(c *connCore, seg []byte) {
-	if len(seg) == 0 {
-		return
-	}
-	if c.in.carry == nil {
-		c.in.carry = append(poolGet(len(seg))[:0], seg...)
-	} else if cap(c.in.carry) >= len(c.in.carry)+len(seg) {
-		c.in.carry = append(c.in.carry, seg...)
-	} else {
-		grow := max(2*cap(c.in.carry), len(c.in.carry)+len(seg))
-		nb := append(poolGet(grow)[:0], c.in.carry...)
-		nb = append(nb, seg...)
-		poolPut(c.in.carry)
-		c.in.carry = nb
-	}
-	c.in.syncPending(l.stats)
-	if len(c.in.carry)+c.in.got > l.cfg.maxPending {
-		l.closeLocal(c, ErrPendingOverflow)
-	}
-}
-
-// stashCarry 把「已从内核读出、尚未投递」的字节存进 carry。
+// stashCarry 把「已从内核读出、尚未投递」的字节存进 carry，缓冲管理交给
+// inboundState.appendCarry，这里只留策略：
+//
 // bounded = true 时施加 MaxPending 封顶——暂停与投递预算截断都属于这一类
 // （两者都可能让 carry 无限增长，而 06 对 MaxPending 的定义正是这一块）。
 // 帧边界不足留下的尾巴（bounded = false）天然 ≤ 一次读的量，不需要封顶。
 func (l *loop) stashCarry(c *connCore, data []byte, bounded bool) {
-	if len(data) > 0 {
-		buf := poolGet(len(data))
-		copy(buf, data)
-		c.in.carry = buf
-	}
+	c.in.appendCarry(data)
 	c.in.syncPending(l.stats)
-	if bounded && len(data)+c.in.got > l.cfg.maxPending {
+	if bounded && len(c.in.carry)+c.in.got > l.cfg.maxPending {
 		l.closeLocal(c, ErrPendingOverflow)
 	}
 }
@@ -702,14 +671,7 @@ func (l *loop) processCarry(c *connCore) {
 	if c.state != stateOpen || c.pauseDepth > 0 || c.in.carry == nil {
 		return
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			l.closeLocal(c, fmt.Errorf("%w: %v", ErrHandlerPanic, r))
-			l.cancelAsync(c) // 连接要关：不启动已注册的任务（01 D18）
-			return
-		}
-		l.launchAsync(c) // 正常出口的兜底（gateSink 已处理逐条的情形）
-	}()
+	defer l.callbackBarrier(c)
 	c.out.beginInLoop()
 	defer l.flushBatchEnd(c)
 	// 直接在 carry 缓冲上解析，不借道 rbuf——WS 路径下一个 WS 帧可以装下
@@ -740,8 +702,10 @@ func (l *loop) enterDraining(c *connCore) {
 	if c.state >= stateDraining {
 		return
 	}
-	// 到这里 closing 一定已由 beginClose 置位（两个关闭入口都先仲裁）。
-	// 极少数直达路径（Shutdown 的 ctx 强拆）没走仲裁，这里补一次。
+	// 到这里 closing 必然已由 beginClose 置位：三个入口（requestClose、
+	// closeLocal、写失败的 fatal 钩子）都在调用之前仲裁过。下面这句是
+	// 断言性的兜底，不是某条已知路径的补救——真走到了说明有人新开了一条
+	// 绕过仲裁的入口，那时至少 reason 不会是 nil。
 	if !c.closing.Load() {
 		c.beginClose(ErrServerClosed)
 	}
@@ -756,9 +720,9 @@ func (l *loop) enterDraining(c *connCore) {
 		l.detach(c)
 		return
 	}
-	if c.cb.onDrain != nil && prev == stateOpen {
+	if c.onDrain != nil && prev == stateOpen {
 		// closing 已置位：close 帧走 force 路径追加，FIFO 保证它在最后（W13）。
-		c.cb.onDrain(reason)
+		c.onDrain(reason)
 	}
 	c.state = stateDraining
 	l.idleLRU.remove(&c.tnode)
@@ -801,9 +765,13 @@ func (l *loop) detach(c *connCore) {
 		c.ws.release()
 	}
 	// 5. 从五条 LRU 摘除；槽位置 nil；gen++。
+	// pause 链不在这里直接 remove：它的链表归属与 ConnsPaused 计数是一对，
+	// 由 exitPaused 一次结清（幂等，晚到的 resume 控制项也调它）。
+	// enterPaused/exitPaused 是 pauseLRU 仅有的两个修改点——多一处直接
+	// remove，链表和计数就会分家，而只有计数会被断言看见。
 	l.idleLRU.remove(&c.tnode)
 	l.hsLRU.remove(&c.tnode)
-	l.pauseLRU.remove(&c.tnode)
+	c.exitPaused(l)
 	l.stallLRU.remove(&c.snode)
 	l.lingerLRU.remove(&c.lnode)
 	s := &l.slots[c.slotIdx]
@@ -816,7 +784,6 @@ func (l *loop) detach(c *connCore) {
 	if c.opened {
 		l.stats.connsOpen.Add(-1)
 	}
-	c.exitPaused(l) // 读闸的链表归属与计数在这里一次结清（幂等）
 	if l.onConnClosed != nil {
 		l.onConnClosed(c)
 	}

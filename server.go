@@ -279,6 +279,7 @@ func (s *Server[S]) Shutdown(ctx context.Context) error {
 	tick := time.NewTicker(2 * time.Millisecond)
 	defer tick.Stop()
 	forced := false
+drain:
 	for s.conns.Load() > 0 {
 		select {
 		case <-ctx.Done():
@@ -303,12 +304,11 @@ func (s *Server[S]) Shutdown(ctx context.Context) error {
 			if !s.waitFor(func() bool { return s.conns.Load() == 0 }) {
 				s.log.Warn("gate: shutdown deadline exceeded, forcing loop stop",
 					zap.Int64("conns_left", s.conns.Load()))
-				goto stop
+				break drain
 			}
 		case <-tick.C:
 		}
 	}
-stop:
 	// 3. socket 已经全部拆除。给 loop 置停止位后**立即返回**——它们可能还
 	// 要多活一会儿，去给带在途 AsyncDo 的连接补最后一次 OnClose（01：
 	// Shutdown 不等待这些任务）。真正的收尾由 Wait 观察。
@@ -346,6 +346,24 @@ func (s *Server[S]) closeListeners() {
 
 // ─── accept ───
 
+// reserveSlot 在一个上限下原子占位；limit <= 0 表示不限。占不到返回 false，
+// 且计数已经回滚。
+//
+// 先加再比、超了再退，而不是 check-then-add：后者在多 loop 并发 accept 下
+// 根本不是原子的，两条连接能同时看到「还差一个」。
+//
+// 之所以是一个函数而不是在两个调用点各写一遍：那两处曾经写成
+// `if limit > 0 && n.Add(1) > limit { n.Add(-1); ... } else if limit <= 0 { n.Add(1) }`
+// ——正确，但正确性完全押在短路求值上，而「不限」分支的那次 Add 藏在 else if 里。
+// 这种形状读起来像 bug，改起来会变成 bug。
+func reserveSlot(n *atomic.Int64, limit int) bool {
+	if n.Add(1) > int64(limit) && limit > 0 {
+		n.Add(-1)
+		return false
+	}
+	return true
+}
+
 const acceptBudget = 64 // 每轮迭代的 accept 上限：连接风暴不饿死已有连接
 
 func (s *Server[S]) accept(l *loop, lfd int) {
@@ -370,16 +388,12 @@ func (s *Server[S]) accept(l *loop, lfd int) {
 			_ = unix.Close(nfd)
 			continue
 		}
-		// MaxConns 先原子占位再放行：check-then-add 在多 loop 下不是原子的。
-		// 满额时 accept 之后立刻 close（明确拒绝）——只跳过的话连接留在
-		// backlog 里，水平触发每轮都报 listener 可读，空转。
-		if mc := s.opts.Limits.MaxConns; mc > 0 && s.conns.Add(1) > int64(mc) {
-			s.conns.Add(-1)
+		// MaxConns 先原子占位再放行。满额时 accept 之后立刻 close（明确拒绝）
+		// ——只跳过的话连接留在 backlog 里，水平触发每轮都报 listener 可读，空转。
+		if !reserveSlot(&s.conns, s.opts.Limits.MaxConns) {
 			_ = unix.Close(nfd)
 			l.stats.connsRejected.Add(1)
 			continue
-		} else if mc <= 0 {
-			s.conns.Add(1)
 		}
 		remote := sockaddrToAddrPort(sa)
 		applySocketOpts(nfd, s.opts.Socket, keepAliveSecs(s.opts.Limits.KeepAlive))
@@ -469,13 +483,10 @@ func (s *Server[S]) registerConn(l *loop, nfd int, remote netip.AddrPort) {
 		// 计数与「已计数」标志一起置，两个释放点（进 Open / 拆除）都只认
 		// 这个标志——拒绝路径先减一次、拆除时再减一次会把计数减成负数，
 		// 之后所有慢握手连接都能绕过 MaxHandshaking。
-		if mh := s.maxHandshaking(); mh > 0 && s.handshaking.Add(1) > int64(mh) {
-			s.handshaking.Add(-1)
+		if !reserveSlot(&s.handshaking, s.maxHandshaking()) {
 			l.stats.connsRejected.Add(1)
 			l.detach(c) // 未 Open 过：不会调 OnClose
 			return
-		} else if mh <= 0 {
-			s.handshaking.Add(1)
 		}
 		c.hsCounted = true
 		l.stats.connsHandshaking.Add(1)
@@ -549,14 +560,7 @@ func (s *Server[S]) proxyRead(l *loop, c *connCore) {
 		if !l.readOK(c, n, err) {
 			return
 		}
-		if c.in.carry == nil {
-			c.in.carry = append(poolGet(n)[:0], l.rbuf[:n]...)
-		} else {
-			nb := append(poolGet(len(c.in.carry) + n)[:0], c.in.carry...)
-			nb = append(nb, l.rbuf[:n]...)
-			poolPut(c.in.carry)
-			c.in.carry = nb
-		}
+		c.in.appendCarry(l.rbuf[:n]) // 上界是 proxyMaxHeaderLen，见下面的边界检查
 		src, consumed, perr := parseProxy(c.in.carry, s.opts.Proxy == ProxyRequired)
 		if perr != nil {
 			l.closeLocal(c, wrapProtocol(perr)) // 头非法：不发任何响应（06 迁移表）

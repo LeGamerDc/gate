@@ -55,13 +55,16 @@ func (b *builtFrame) release() {
 //     自身有 bug，返回 ErrMessageTooLarge 由调用方关连接，绝不写错帧上线路。
 func buildFrame(data []byte, flags byte, enc *zstd.Encoder, tryCompress bool, ci Cipher, maxWire int) (builtFrame, error) {
 	var scratch [maxHeaderSize]byte
-	return buildFrameAAD(data, flags, enc, tryCompress, ci, maxWire, &scratch)
+	return buildFrameInto(&scratch, data, flags, enc, tryCompress, ci, maxWire)
 }
 
-// buildFrameAAD 是热路径变体：aad 头先写进调用方提供的长命 scratch
-// （outbound 传每 loop 的 env.aadHdr）。把 f.hdr 直接切给接口方法 Seal
-// 会让整个 builtFrame 按逃逸分析上堆——每帧一次 48B 分配。
-func buildFrameAAD(data []byte, flags byte, enc *zstd.Encoder, tryCompress bool, ci Cipher, maxWire int, scratch *[maxHeaderSize]byte) (builtFrame, error) {
+// buildFrameInto 是唯一的实现；scratch 是**调用方提供的 AAD 暂存**，
+// 只在调用期间被用到（返回前已复制进 f.hdr），所以每 loop 一份就够。
+//
+// 它作为参数存在不是风格选择：把 f.hdr 直接切给接口方法 Seal，逃逸分析
+// 会把整个 builtFrame 判上堆——每帧一次 48B 分配，直接打掉 01 的
+// 「稳态零堆分配」。热路径不要直接调它，走 outbound.buildFrame。
+func buildFrameInto(scratch *[maxHeaderSize]byte, data []byte, flags byte, enc *zstd.Encoder, tryCompress bool, ci Cipher, maxWire int) (builtFrame, error) {
 	var f builtFrame
 	body := data
 
