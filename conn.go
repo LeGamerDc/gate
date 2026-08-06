@@ -128,8 +128,13 @@ func (c *Conn[S]) Close(reason error) {
 	}
 }
 
-// SetCipher 只能在串行域内调用：入站对下一个被解析的帧生效，
-// 出站经队列 barrier 生效。nil 表示关闭加密。
+// SetCipher 设置逐连接加密：入站对下一个被解析的帧生效，出站经队列 barrier
+// 生效。nil 表示关闭加密。
+//
+// **只能在事件循环线程上调用**——回调（OnOpen / OnMessage / OnClose）与 Post
+// 的函数体。这比 State 的约束窄一格：AsyncDo 的函数体虽然属于业务状态意义上
+// 的串行域，却跑在另一个 goroutine 上，而 cipher 是 loop 私有状态。
+// 在 AsyncDo 里需要它时用 Post 排回去。
 func (c *Conn[S]) SetCipher(ci Cipher) {
 	if core := c.core.Load(); core != nil {
 		core.setCipher(ci)
@@ -143,8 +148,13 @@ func (c *Conn[S]) Post(f func(*Conn[S])) {
 	}
 }
 
-// AsyncDo 在别的 goroutine 上跑 f，但 f 仍属串行域（期间投递暂停）。
-// 只能在串行域内调用；同一连接同时只允许一个在途任务。
+// AsyncDo 在别的 goroutine 上跑 f，f 与该连接的其余回调不重叠（期间投递暂停），
+// 因此在 f 里访问 State 是安全的。同一连接同时只允许一个在途任务。
+//
+// **只能在事件循环线程上调用**（回调与 Post 的函数体），不能在另一个 AsyncDo
+// 的函数体里调——它会碰读闸与 poller 注册这些 loop 私有状态。
+//
+// 连接要关时（回调返回 error 或 panic）已注册的 f **不会启动**。
 func (c *Conn[S]) AsyncDo(f func()) error {
 	core := c.core.Load()
 	if core == nil {
@@ -153,8 +163,11 @@ func (c *Conn[S]) AsyncDo(f func()) error {
 	return core.asyncDo(f)
 }
 
-// Pause 低级原语：只暂停入站，不提供独占保证。只能在串行域内调用；
+// Pause 低级原语：只暂停入站，不提供独占保证。
 // 返回的 resume 幂等、可从任意 goroutine 调用。
+//
+// **只能在事件循环线程上调用**（回调与 Post 的函数体）：它会改读闸深度、
+// LRU 归属与 poller 注册，这些是 loop 私有状态。理由同 SetCipher。
 func (c *Conn[S]) Pause() (resume func()) {
 	core := c.core.Load()
 	if core == nil {

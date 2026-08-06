@@ -251,13 +251,30 @@ type None = struct{}
 | `Close` / `Post` | 任意 goroutine | |
 | `resume`（`Pause` 的返回值） | 任意 goroutine | 幂等 |
 | **`c.State`** | **只能在串行域内**：`OnOpen` / `OnMessage` / `OnClose` / `Post` / **`AsyncDo`** 的函数体 | `Pause` 后自己起的 goroutine **不算** |
-| **`SetCipher`** | 同上（串行域内） | 理由见 [Cipher](#cipher) |
-| `AsyncDo` / `Pause` | 只能在串行域内调用 | |
+| **`SetCipher`** / `AsyncDo` / `Pause` | **只能在事件循环上**：回调与 `Post` 的函数体 | 比 `State` 窄一格——**`AsyncDo` 的函数体不算**，见下 |
 
 一句话记法：**要碰 `State`，就得在串行域里；不在的话用 `Post` 排进去。**
 
 「串行域」= 这条连接上所有由 gate 排定顺序的执行体。`AsyncDo` 的函数体虽然跑在另一个
 goroutine 上，但 gate 保证它与其余成员不重叠，见[阻塞任务](#阻塞任务asyncdo-与-pause)。
+
+**但改 gate 自己的连接状态（`SetCipher` / `Pause` / `AsyncDo`）要求更严一格：
+必须在事件循环线程上。** 这三个动作会碰 cipher、读闸深度、LRU 归属、poller 注册——
+它们是 loop 私有的，而 `AsyncDo` 的函数体跑在别的 goroutine 上，同一时刻 loop 仍可能
+因超时或 `Shutdown` 在拆这条连接。在 `AsyncDo` 里需要它们时用 `Post` 排回去：
+
+```go
+c.AsyncDo(func() {
+    key := negotiate()            // 慢调用
+    c.State.key = key             // 业务状态：这里直接改是安全的
+    c.Post(func(c *gate.Conn[*player]) {
+        c.SetCipher(newCipher(key)) // gate 状态：排回事件循环
+    })
+})
+```
+
+Go 里没有可靠的「我在哪个 goroutine 上」，所以这是一条契约而不是运行时检查，
+由 `-race` 兜底。
 
 ---
 

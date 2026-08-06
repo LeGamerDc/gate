@@ -459,8 +459,19 @@ type stage1Item struct {
 入站的 cipher 是一个普通字段，只在串行域内被读写（解密发生在 loop 上，
 `SetCipher` 也必须在串行域内调用）。切换在**下一个被解析的帧**生效。
 
-因此 `SetCipher` 的完整要求是：**只能在串行域内调用**（回调、`Post`、`AsyncDo` 的函数体）。
-它同时做两件事：立刻换入站 cipher，往出站队列追加一个 barrier。
+因此 `SetCipher` 的完整要求是：**只能在 loop 线程上调用**——回调（`OnOpen` /
+`OnMessage` / `OnClose`）与 `Post` 的函数体。它同时做两件事：立刻换入站 cipher，
+往出站队列追加一个 barrier。
+
+> **`AsyncDo` 的函数体不算。** 「串行域」这个词在两个层面上成立，但范围不同：
+> 对**业务状态**（`Conn.State`）它包含 `AsyncDo` 的函数体——gate 保证那段代码
+> 与其余成员不重叠，这正是 `AsyncDo` 存在的理由（[01 的 D18](01-server-api.md#d18-把-asyncdo-的函数体拉进串行域)）；
+> 但对 **gate 自己的连接状态**（cipher、读闸深度、LRU 归属、poller 注册）
+> 它不包含——那段代码跑在另一个 goroutine 上，而 loop 仍可能因超时、
+> `Shutdown` 或写失败在同一时刻执行 `enterDraining` / `detach`。
+> 在 `AsyncDo` 里改 gate 状态要经 `Post` 排回 loop。实现无法检测这类误用
+> （Go 里没有可靠的「我在哪个 goroutine 上」），所以这是一条契约，
+> 由 `-race` 兜底。同一条约束适用于 `Pause` 与 `AsyncDo` 自身。
 
 ### AAD：完整帧头进入认证范围
 
