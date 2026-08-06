@@ -129,6 +129,14 @@ func (l *loop) run() {
 	for !l.stop.Load() {
 		l.step()
 	}
+	// 退出前把还挂在本 loop 上的连接拆干净。强制 Shutdown 到点时可能仍有
+	// 连接没走完拆除序列，而 fd 只能由 loop 线程关（R2）——这里是最后机会。
+	for i := range l.slots {
+		if c := l.slots[i].c; c != nil {
+			l.closeLocal(c, ErrServerClosed)
+			l.detach(c)
+		}
+	}
 	if l.reserveFd >= 0 {
 		_ = unixClose(l.reserveFd)
 	}
@@ -767,6 +775,7 @@ func (l *loop) finishClose(c *connCore) {
 		return
 	}
 	c.state = stateClosed
+	defer c.finalize()
 	if !c.opened || c.cb.onClose == nil {
 		return
 	}
@@ -776,4 +785,13 @@ func (l *loop) finishClose(c *connCore) {
 		}
 	}()
 	c.cb.onClose(c.closeReason())
+}
+
+// finalize 是连接生命周期的最后一步，Closed 之后恰好一次。
+func (c *connCore) finalize() {
+	if c.onFinalized != nil {
+		fn := c.onFinalized
+		c.onFinalized = nil
+		fn()
+	}
 }

@@ -45,7 +45,8 @@ type Server[S any] struct {
 	lns   []int // listener fds
 	addr  netip.AddrPort
 
-	conns       atomic.Int64 // MaxConns 先原子占位再 accept
+	conns       atomic.Int64 // MaxConns 的准入占位；拆除（fd 归还）时释放
+	live        atomic.Int64 // 尚未走完 OnClose 的连接；Shutdown 等的是它
 	handshaking atomic.Int64 // MaxHandshaking 同理
 
 	budget *serverBudget // MaxOutboundBytes：各 loop 按租约分配（近似口径）
@@ -146,10 +147,7 @@ func Listen[S any](opts Options[S]) (*Server[S], error) {
 		l.env.quota = newQuotaLease(s.budget)
 		l.onConnClosed = func(c *connCore) {
 			s.conns.Add(-1)
-			if c.hsCtx != nil { // 死在握手期：Open 前的计数要退回
-				s.handshaking.Add(-1)
-				l.stats.connsHandshaking.Add(-1)
-			}
+			s.releaseHandshake(l, c) // 死在握手期：退回握手计数（幂等）
 		}
 		l.onAccept = func(lfd int) { s.accept(l, lfd) }
 		l.onHsRead = func(c *connCore) { s.hsRead(l, c) }
@@ -271,26 +269,38 @@ func (s *Server[S]) Shutdown(ctx context.Context) error {
 		})
 		l.wk.maybeNotify()
 	}
-	// 2. 等排空或 ctx 到期。
-	tick := time.NewTicker(5 * time.Millisecond)
+	// 2. 等每条连接走完 OnClose。等的是 live 而不是 conns：拆 socket
+	// （conns 的释放点）不等在途 AsyncDo，而 OnClose 要等——按 conns 收尾
+	// 会在任务还没回来时就停掉 loop，那些连接的 OnClose 永远不会触发。
+	tick := time.NewTicker(2 * time.Millisecond)
 	defer tick.Stop()
-	for s.conns.Load() > 0 {
+	forced := false
+	for s.live.Load() > 0 {
 		select {
 		case <-ctx.Done():
-			// 放弃剩余 flush：强制拆除。
-			for _, l := range s.loops {
-				l.box.push(func() {
-					for i := range l.slots {
-						if c := l.slots[i].c; c != nil {
-							l.enterDraining(c)
-							l.detach(c)
+			if !forced {
+				forced = true
+				// 放弃剩余 flush：强制拆除。仍然经收件箱回 loop 线程执行
+				// （R2：所有 syscall 在 loop 上）。
+				for _, l := range s.loops {
+					l.box.push(func() {
+						for i := range l.slots {
+							if c := l.slots[i].c; c != nil {
+								l.closeLocal(c, ErrServerClosed)
+								l.detach(c)
+							}
 						}
-					}
-				})
-				l.wk.maybeNotify()
+					})
+					l.wk.maybeNotify()
+				}
 			}
-			s.waitFor(func() bool { return s.conns.Load() == 0 })
-			goto stop
+			// 强拆之后仍留一小段时间让 loop 真正执行它；到点就停——
+			// 业务回调可能永不返回，那时谁也救不了（01「ctx 约束的是什么」）。
+			if !s.waitFor(ctx, func() bool { return s.live.Load() == 0 }) {
+				s.log.Warn("gate: shutdown deadline exceeded, forcing loop stop",
+					zap.Int64("conns_left", s.live.Load()))
+				goto stop
+			}
 		case <-tick.C:
 		}
 	}
@@ -304,11 +314,19 @@ stop:
 	return s.waitErr
 }
 
-func (s *Server[S]) waitFor(cond func() bool) {
-	deadline := time.Now().Add(time.Second)
-	for !cond() && time.Now().Before(deadline) {
+// waitFor 等条件成立，最多 forceGrace；返回条件是否真的成立
+// （旧实现不报告结果，超时后照样停 loop，残余 fd 无人回收）。
+const forceGrace = 500 * time.Millisecond
+
+func (s *Server[S]) waitFor(ctx context.Context, cond func() bool) bool {
+	deadline := time.Now().Add(forceGrace)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
 		time.Sleep(2 * time.Millisecond)
 	}
+	return cond()
 }
 
 func (s *Server[S]) closeListeners() {
@@ -417,6 +435,14 @@ func (s *Server[S]) fdExhausted(l *loop, lfd int, cause error) {
 
 // registerConn 在目标 loop 上落地一条新连接（loop 线程）。
 func (s *Server[S]) registerConn(l *loop, nfd int, remote netip.AddrPort) {
+	// macOS 的跨 loop 投递让 accept 与注册之间隔了一次调度：Shutdown 可能
+	// 恰好在这中间跑完「关闭现有 slots」的快照。不重查的话这条连接会活过
+	// 整轮 Shutdown，而 conns 已经占位，无 deadline 的 Shutdown 会永久等待。
+	if s.closed.Load() {
+		_ = unix.Close(nfd)
+		s.conns.Add(-1)
+		return
+	}
 	c, err := l.attach(nfd, coreCallbacks{})
 	if err != nil {
 		_ = unix.Close(nfd)
@@ -424,11 +450,16 @@ func (s *Server[S]) registerConn(l *loop, nfd int, remote netip.AddrPort) {
 		s.log.Warn("gate: register conn", zap.Error(err))
 		return
 	}
+	s.live.Add(1)
+	c.onFinalized = func() { s.live.Add(-1) }
 	c.hsCtx = &hsContext[S]{srv: s, remote: remote, id: l.nextConnID()}
 
 	needProxy := s.opts.Proxy != ProxyOff
 	needWS := s.opts.WebSocket != nil
 	if needProxy || needWS {
+		// 计数与「已计数」标志一起置，两个释放点（进 Open / 拆除）都只认
+		// 这个标志——拒绝路径先减一次、拆除时再减一次会把计数减成负数，
+		// 之后所有慢握手连接都能绕过 MaxHandshaking。
 		if mh := s.maxHandshaking(); mh > 0 && s.handshaking.Add(1) > int64(mh) {
 			s.handshaking.Add(-1)
 			l.stats.connsRejected.Add(1)
@@ -437,6 +468,7 @@ func (s *Server[S]) registerConn(l *loop, nfd int, remote netip.AddrPort) {
 		} else if mh <= 0 {
 			s.handshaking.Add(1)
 		}
+		c.hsCounted = true
 		l.stats.connsHandshaking.Add(1)
 		if needProxy {
 			c.state = stateProxy
@@ -448,6 +480,17 @@ func (s *Server[S]) registerConn(l *loop, nfd int, remote netip.AddrPort) {
 		return
 	}
 	s.finishOpen(l, c, nil)
+}
+
+// releaseHandshake 归还握手期计数，幂等：进入 Open 与拆除都会调用它，
+// 而一条连接可能两条路都走过（先 Open 再关闭）。
+func (s *Server[S]) releaseHandshake(l *loop, c *connCore) {
+	if !c.hsCounted {
+		return
+	}
+	c.hsCounted = false
+	s.handshaking.Add(-1)
+	l.stats.connsHandshaking.Add(-1)
 }
 
 func (s *Server[S]) maxHandshaking() int {
@@ -464,10 +507,7 @@ func (s *Server[S]) maxHandshaking() int {
 func (s *Server[S]) finishOpen(l *loop, c *connCore, hs *Handshake) {
 	ctx := c.hsCtx.(*hsContext[S])
 	c.hsCtx = nil // 握手态释放（W9）
-	if c.state == stateProxy || c.state == stateHandshaking {
-		s.handshaking.Add(-1)
-		l.stats.connsHandshaking.Add(-1)
-	}
+	s.releaseHandshake(l, c)
 	bindConn(s.opts.Handler, c, ctx.id, ctx.remote, hs)
 	l.openConn(c)
 }
@@ -489,8 +529,7 @@ func (s *Server[S]) hsRead(l *loop, c *connCore) {
 // bindBeforeOpen 在 101 已入队、openConn 之前绑定壳。
 func (s *Server[S]) bindBeforeOpen(l *loop, c *connCore, ctx *hsContext[S], hs *Handshake) {
 	c.hsCtx = nil
-	s.handshaking.Add(-1)
-	l.stats.connsHandshaking.Add(-1)
+	s.releaseHandshake(l, c)
 	bindConn(s.opts.Handler, c, ctx.id, ctx.remote, hs)
 }
 

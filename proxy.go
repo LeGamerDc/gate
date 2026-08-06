@@ -46,23 +46,34 @@ func parseProxy(data []byte, required bool) (src netip.AddrPort, n int, err erro
 	if len(data) == 0 {
 		return netip.AddrPort{}, 0, nil
 	}
-	// v2 优先（签名更长且首字节 0x0D 与 v1 的 'P' 不冲突）。
+	// 「首字节撞上签名」不等于「这是个坏 PROXY 头」：一条 m=0、长度在
+	// [0x0D00, 0x0DFF] 的合法 gate 帧首字节就是 0x0D。Optional 模式下
+	// 签名对不上必须回退成普通字节流，否则合法客户端会被当成畸形头断开。
+	bad := func() (netip.AddrPort, int, error) {
+		if required {
+			return netip.AddrPort{}, 0, errProxyMalformed
+		}
+		return netip.AddrPort{}, -1, nil
+	}
 	if data[0] == proxyV2Sig[0] {
 		if len(data) < len(proxyV2Sig) {
 			if bytes.HasPrefix(proxyV2Sig, data) {
-				return netip.AddrPort{}, 0, nil
+				return netip.AddrPort{}, 0, nil // 还看不出来，等更多字节
 			}
-			return netip.AddrPort{}, 0, errProxyMalformed
+			return bad()
 		}
 		if !bytes.HasPrefix(data, proxyV2Sig) {
-			return netip.AddrPort{}, 0, errProxyMalformed
+			return bad()
 		}
 		return parseProxyV2(data)
 	}
 	if data[0] == 'P' {
 		probe := min(len(data), len(proxyV1Sig))
-		if !bytes.HasPrefix(proxyV1Sig[:probe], data[:probe]) && !bytes.HasPrefix(data, proxyV1Sig) {
-			return netip.AddrPort{}, 0, errProxyMalformed
+		if !bytes.Equal(data[:probe], proxyV1Sig[:probe]) {
+			return bad()
+		}
+		if len(data) < len(proxyV1Sig) {
+			return netip.AddrPort{}, 0, nil
 		}
 		return parseProxyV1(data)
 	}
