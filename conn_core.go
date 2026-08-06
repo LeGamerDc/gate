@@ -294,8 +294,7 @@ func (c *connCore) startDeliverBudget(l *loop) {
 
 func (c *connCore) enterPaused(l *loop) {
 	l.modInterest(c, c.currentInterest()&^interestRead)
-	l.idleLRU.remove(&c.tnode)
-	l.pauseLRU.pushBack(&c.tnode, l.now())
+	l.pauseLRU.pushBack(&c.tnode, l.now()) // pushBack 自带 unlink：从 idle 链转过来
 	c.pausedActive = true
 	l.stats.connsPaused.Add(1)
 }
@@ -307,7 +306,7 @@ func (c *connCore) exitPaused(l *loop) {
 		return
 	}
 	c.pausedActive = false
-	l.pauseLRU.remove(&c.tnode)
+	c.tnode.unlink()
 	l.stats.connsPaused.Add(-1)
 }
 

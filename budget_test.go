@@ -12,7 +12,7 @@ func TestP0_WSCarryMayExceedRbuf(t *testing.T) {
 	h := newWSHarness(t, func(c *loopConfig) {
 		c.maxPending = 8 << 20 // 放开 MaxPending，专测 carry 上界本身
 	})
-	// 一个 WS 帧里塞 3000 条小 gate 帧：超过每读事件 1024 条的投递预算，
+	// 一个 WS 帧里塞 3000 条小 gate 帧：超过每轮迭代 1024 条的投递预算，
 	// 剩余部分（远大于 64KB rbuf）必须能安全地留在 carry 里。
 	msgs := make([][]byte, 3000)
 	for i := range msgs {
@@ -38,8 +38,9 @@ func TestP0_WSCarryMayExceedRbuf(t *testing.T) {
 	h.verifyConservation()
 }
 
-// 投递预算是每读事件的：WS 把一个读事件切成多段 emit 时不得被重置。
-func TestP0_DeliverBudgetPerReadEvent(t *testing.T) {
+// 投递预算是**每轮迭代**（tick）的连接级计数：WS 把一个读事件切成多段 emit、
+// carry 又在同一轮里续投，任何一段都不得重置它。
+func TestP0_DeliverBudgetPerLoopIteration(t *testing.T) {
 	h := newWSHarness(t, func(c *loopConfig) { c.maxPending = 8 << 20 })
 	msgs := make([][]byte, 1500)
 	for i := range msgs {

@@ -144,15 +144,18 @@ func parseProxyV2(data []byte) (netip.AddrPort, int, error) {
 	if verCmd&0x0F == 0x0 { // LOCAL：健康检查等，不带地址语义
 		return netip.AddrPort{}, total, nil
 	}
-	// family|protocol 只接受规范定义的组合（HAProxy PROXY protocol §2.2）：
-	// 0x00 UNSPEC、0x11/0x12 INET、0x21/0x22 INET6、0x31/0x32 UNIX。
+	// family|protocol 只接受规范定义的组合（HAProxy PROXY protocol §2.2）中
+	// **TCP listener 上可能出现**的那几个：0x00 UNSPEC、0x11 INET+STREAM、
+	// 0x21 INET6+STREAM、0x31 UNIX+STREAM。对应的 DGRAM 变体（0x12/0x22/0x32）
+	// 已在上面统一拒掉，这里不再列——列出来会读成「这些分支是活的」，
+	// 而改它们不会有任何效果。
 	// 未知 family 必须拒绝——放行等于让上游用一个我们不理解的地址族
 	// 决定 Remote()。
 	body := data[16:total]
 	switch fam {
 	case 0x00: // UNSPEC：合法，但不带地址语义
 		return netip.AddrPort{}, total, nil
-	case 0x11, 0x12: // AF_INET + STREAM/DGRAM
+	case 0x11: // AF_INET + STREAM
 		if alen < 12 {
 			return netip.AddrPort{}, 0, errProxyMalformed
 		}

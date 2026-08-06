@@ -64,7 +64,12 @@ type wsState struct {
 	ctrlOp  byte
 	ctrlLen int
 
-	closeSent bool // 本地 close 帧已入出站链：之后不再排数据帧（W13）
+	// closeSent 是 wsOnDrain 的幂等标志：close 帧已排进出站链，别再排一个。
+	// 它**不是**准入闸——「close 帧之后不再有数据帧」（W13）由权威的关闭状态
+	// 保证（beginClose 在出站锁内置 closing，之后 Send 一律失败），发送路径
+	// 根本不读这个字段。将来真做完整的 close handshake、CLOSE_SENT 要活一段
+	// 时间时，别指望它挡住数据——那时应当引入一个 WS phase 并让准入去读它。
+	closeSent bool
 	closeRecv bool // 收到对端 close 帧：之后入站数据帧不再投递
 	replyCode int  // closeRecv 时要回的状态码（0 = 不带码，对应对端 1005）
 }

@@ -81,16 +81,16 @@ func TestOutbound_ConcurrentSendersLinearize(t *testing.T) {
 	// loop goroutine（当前 goroutine）：排空 dirty 直到发送者收工且队列干净。
 	for {
 		if d := loop.pop(); d != nil {
-			d.flush(true, false)
+			d.flushDirty()
 			continue
 		}
 		select {
 		case <-done:
 			if d := loop.pop(); d != nil {
-				d.flush(true, false)
+				d.flushDirty()
 				continue
 			}
-			o.flush(false, false)
+			o.flushNow()
 			goto verify
 		default:
 			runtime.Gosched()

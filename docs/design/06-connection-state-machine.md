@@ -436,8 +436,9 @@ stage 1 是一个 tagged union，而不是单一的消息数组：
 
 ```go
 type stage1Item struct {
-	kind   itemKind // itemMessage | itemFrame | itemCipherBarrier
-	// itemMessage
+	kind   itemKind // itemMessage | itemFrame | itemCipherBarrier | itemRaw
+	// itemMessage（itemRaw 复用 data：已是最终线路字节的原始段，
+	//              绕过编码与 WS 封帧，但仍走同一条 FIFO ⇒ W13）
 	data                    []byte
 	maskPermit, maskAlready byte
 	// itemFrame

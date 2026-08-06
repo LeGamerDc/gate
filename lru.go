@@ -29,11 +29,10 @@ func (l *lruList) front() *lruNode {
 }
 
 // pushBack 先摘再挂：同一个侵入式节点同时属于两条链会直接覆盖指针，
-// 把两条链一起毁掉。这里的 remove 对「不在任何链上」是 no-op，
-// 但注意它只能摘掉**本链**的归属——跨链的互斥仍由调用方保证
-// （enterPaused/exitPaused），这一行只是最后一道结构性防御。
+// 把两条链一起毁掉。unlink 摘的是节点**当前所在的那条链**，跨链也管用，
+// 所以这一行是结构性的防御而不只是清理。
 func (l *lruList) pushBack(n *lruNode, when int64) {
-	l.remove(n)
+	n.unlink()
 	n.when = when
 	n.prev = l.root.prev
 	n.next = &l.root
@@ -41,8 +40,16 @@ func (l *lruList) pushBack(n *lruNode, when int64) {
 	l.root.prev = n
 }
 
-// remove 幂等：不在链上（prev==nil）直接返回。
-func (l *lruList) remove(n *lruNode) {
+// unlink 把节点从它**当前所在**的链上摘下来；不在任何链上时是 no-op。
+//
+// 它是节点的方法而不是链的方法，因为它本来就不需要知道是哪条链——环形双链
+// 的摘除只用到节点自己的两个指针。写成 `someList.remove(n)` 会给出一个假的
+// 承诺：读起来像「从 someList 摘除」，实际是「从 n 所在的任何链摘除」，
+// 传错链一样生效且静默。下一次加一条超时链时，那个假承诺就是 bug 的入口。
+//
+// 跨链互斥另有保证：读闸的归属与 ConnsPaused 计数由 enterPaused/exitPaused
+// 成对维护，unlink 不碰计数。
+func (n *lruNode) unlink() {
 	if n.prev == nil {
 		return
 	}
@@ -70,7 +77,7 @@ func (l *lruList) expire(timeout, now int64, fn func(*connCore)) {
 		if n == nil || n.when+timeout > now {
 			return
 		}
-		l.remove(n)
+		n.unlink()
 		fn(n.c)
 	}
 }

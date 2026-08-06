@@ -262,7 +262,7 @@ func (l *loop) attach(fd int, cb coreCallbacks) (*connCore, error) {
 // openConn 完成 * → Open 的迁移：唯一触发业务回调的状态。
 // onOpen 返回 error ⇒ 拒绝连接，立即关闭且不配对 onClose。
 func (l *loop) openConn(c *connCore) {
-	l.hsLRU.remove(&c.tnode)
+	c.tnode.unlink() // 离开握手链
 	c.state = stateOpen
 	c.out.setFlushable(true)
 
@@ -364,7 +364,7 @@ func (l *loop) step() {
 	}
 	for _, o := range l.dirtyScratch {
 		c := o.owner
-		st := o.flush(true, false)
+		st := o.flushDirty()
 		l.applyWriteStatus(c, st)
 	}
 
@@ -444,7 +444,7 @@ func (l *loop) connWritable(c *connCore) {
 func (l *loop) applyWriteStatus(c *connCore, st writeStatus) {
 	switch st {
 	case writeIdle:
-		l.stallLRU.remove(&c.snode)
+		c.snode.unlink()
 		if c.state == stateDraining {
 			l.detach(c) // 排空 → Detached
 			return
@@ -692,7 +692,7 @@ func (l *loop) processCarry(c *connCore) {
 
 // flushBatchEnd 在处理完一个连接的入站批之后调用：清 inLoop 并 flush（O14）。
 func (l *loop) flushBatchEnd(c *connCore) {
-	st := c.out.flush(false, true)
+	st := c.out.flushBatch()
 	l.applyWriteStatus(c, st)
 }
 
@@ -718,8 +718,7 @@ func (l *loop) enterDraining(c *connCore) {
 	// 直接拆除（05「本地主动关闭」的最后一行）。
 	if c.out.wireBroken {
 		c.state = stateDraining
-		l.idleLRU.remove(&c.tnode)
-		l.hsLRU.remove(&c.tnode)
+		c.tnode.unlink()
 		l.detach(c)
 		return
 	}
@@ -728,12 +727,10 @@ func (l *loop) enterDraining(c *connCore) {
 		c.onDrain(reason)
 	}
 	c.state = stateDraining
-	l.idleLRU.remove(&c.tnode)
-	l.hsLRU.remove(&c.tnode)
-	// pause 子状态保留（MaxPause 兜底 resume 永不来的场景）。
+	c.tnode.unlink() // idle / 握手归属；pause 子状态保留（MaxPause 兜底 resume 永不来）
 	l.lingerLRU.pushBack(&c.lnode, l.now())
 
-	st := c.out.flush(false, false)
+	st := c.out.flushNow()
 	if st == writeFailed {
 		l.detach(c)
 		return
@@ -767,16 +764,14 @@ func (l *loop) detach(c *connCore) {
 	if c.ws != nil {
 		c.ws.release()
 	}
-	// 5. 从五条 LRU 摘除；槽位置 nil；gen++。
-	// pause 链不在这里直接 remove：它的链表归属与 ConnsPaused 计数是一对，
-	// 由 exitPaused 一次结清（幂等，晚到的 resume 控制项也调它）。
-	// enterPaused/exitPaused 是 pauseLRU 仅有的两个修改点——多一处直接
-	// remove，链表和计数就会分家，而只有计数会被断言看见。
-	l.idleLRU.remove(&c.tnode)
-	l.hsLRU.remove(&c.tnode)
+	// 5. 三个侵入式节点各摘一次；槽位置 nil；gen++。
+	// exitPaused 要先走：读闸的链表归属与 ConnsPaused 计数是一对，必须由它
+	// 一次结清（幂等，晚到的 resume 控制项也调它）。之后的 unlink 兜住
+	// tnode 落在 idle / 握手链上的情形。
 	c.exitPaused(l)
-	l.stallLRU.remove(&c.snode)
-	l.lingerLRU.remove(&c.lnode)
+	c.tnode.unlink()
+	c.snode.unlink()
+	c.lnode.unlink()
 	s := &l.slots[c.slotIdx]
 	s.c = nil
 	s.gen = (s.gen + 1) & genMask

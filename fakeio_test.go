@@ -114,7 +114,7 @@ func (l *fakeLoop) drainDirty() writeStatus {
 		} else {
 			l.dirty = l.dirty[1:]
 		}
-		st = o.flush(true, false)
+		st = o.flushDirty()
 	}
 	return st
 }

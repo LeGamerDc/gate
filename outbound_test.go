@@ -317,7 +317,7 @@ func TestO9_SendFrameChecksBeforeRetain(t *testing.T) {
 func TestO10_FlushIdempotentOnEmptyQueue(t *testing.T) {
 	o, io, _ := newTestOutbound(t)
 	for range 3 {
-		if st := o.flush(false, false); st != writeIdle {
+		if st := o.flushNow(); st != writeIdle {
 			t.Fatal(st)
 		}
 	}
@@ -439,7 +439,7 @@ func TestO14_InLoopSuppressesArmUntilBatchEnd(t *testing.T) {
 	if len(loop.dirty) != 0 {
 		t.Fatal("inLoop 期间不该 arm（批收尾必然 flush）")
 	}
-	if st := o.flush(false, true); st != writeIdle { // 批收尾：清 inLoop + flush
+	if st := o.flushBatch(); st != writeIdle { // 批收尾：清 inLoop + flush
 		t.Fatal(st)
 	}
 	if io.wrote.Len() == 0 {
@@ -483,7 +483,7 @@ func TestWritable_HighWater(t *testing.T) {
 	if o.isWritable() {
 		t.Fatal("越过高水位应转 false")
 	}
-	o.flush(false, false) // 写光后恢复
+	o.flushNow() // 写光后恢复
 	if !o.isWritable() {
 		t.Fatal("排空后应恢复 writable")
 	}

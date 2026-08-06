@@ -157,6 +157,25 @@ bug** 的复查，判据是这套文档一贯的那条：**靠纪律维持的不
 `-race` 才抓得到的数据竞争。**勘误的收尾动作应该是 grep 全仓，而不是改完指出的
 那一行。**
 
+随后的一轮独立评审又找出四处同类，而且都在**文档自己的伪码里**——文档是事实来源，
+伪码错了比注释错了更贵：
+
+| 位置 | 留着的旧说法 |
+| --- | --- |
+| 01 的 D25 | 「调用约束从『事件循环上』**放宽**到『串行域内』」——决策记录本身写着已撤销的方向 |
+| 04 的关闭伪码 | `if !c.closing.swap(true): 记录 reason` ——正是被 P0-1 否掉的「CAS + 稍后记 reason」两步方案 |
+| 05 的 `inbound` 接口伪码 | 「`emit` 返回 error 表示上层要求停止（**暂停** / 关闭 / 协议错误）」——暂停恰恰**不能**停止 `feed`，否则 maskOff 相位与 WS 帧边界一起错位 |
+| 03 / 06 的 `stage1Item` | 漏了 `itemRaw`——照文档重构编码器会把 101 / HTTP 拒绝 / WS 控制帧再次送进 gate 编码与 WS 封帧 |
+
+同一轮的其余结构性整改：`sendRaw(b, force)` 的布尔拆成 `sendRaw` /
+`appendClosingFrame`（布尔不会告诉调用方它凭什么可以传 `true`）；`flush` 的两个
+相邻布尔拆成 `flushDirty` / `flushBatch` / `flushNow`；三处手写的
+`MessagesOut`/`BytesOutRaw` 收进 `commitAccepted`（「什么算被接受」只该有一处定义）；
+`lruList.remove(n)` 改成 `n.unlink()`——它根本不读接收者，写成链的方法等于给出一个
+假承诺，读起来像「从这条链摘除」，实际是「从 n 所在的任何链摘除」，传错链一样静默
+生效；`closeSent` 的注释不再声称它挡得住数据帧（真正挡住的是权威的 closing 状态）；
+PROXY v2 的 DGRAM 组合不再在 switch 里列成活分支。
+
 实现层面记录在案的规格偏离（均有代码注释说明理由）：
 
 - kqueue 的 token 不走 `udata` 而走 fd 索引表——Go 的精确 GC 不允许把非指针值

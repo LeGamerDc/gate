@@ -23,7 +23,7 @@ func enableWS(c *connCore) {
 // wsOnDrain 是进入 Draining 时的钩子：按 reason 决定发不发 close 帧（W10）。
 // 调用时 closing **已经**由 beginClose 置位——顺序是反过来的，且必须反过来：
 // 先关闭再回帧，业务数据才进不来，close 帧才可能是 FIFO 的最后一段。
-// 它靠 sendRaw 的 force 路径豁免这道闸（见下）。
+// 它靠 appendClosingFrame 豁免这道闸——那个方法的名字本身就说明了它凭什么可以。
 func wsOnDrain(c *connCore) func(error) {
 	return func(reason error) {
 		w := c.ws
@@ -46,9 +46,9 @@ func wsOnDrain(c *connCore) func(error) {
 			}
 			frame = wsCloseFrame(code, "")
 		}
-		// force：此刻 closing 已由 beginClose 置位，业务数据再也进不来，
+		// appendClosingFrame：此刻 closing 已由 beginClose 置位，业务数据再也进不来，
 		// 所以这一帧结构上必然是 FIFO 的最后一段（W13）。
-		if c.out.sendRaw(frame, true) == nil {
+		if c.out.appendClosingFrame(frame) == nil {
 			w.closeSent = true
 		}
 	}
@@ -163,7 +163,7 @@ func (l *loop) wsCtrl(c *connCore, op byte, payload []byte) error {
 	case wsOpPing:
 		// pong 走正常准入：ping 洪水下 pong 被 ErrSendQueueFull 挡掉即可，
 		// 不值得为它突破 MaxBuffer（对端本来就没在读）。
-		_ = c.out.sendRaw(wsControlFrame(wsOpPong, payload), false)
+		_ = c.out.sendRaw(wsControlFrame(wsOpPong, payload))
 	case wsOpPong:
 		// 我们不主动 ping；对端的 pong 忽略。
 	case wsOpClose:
@@ -179,7 +179,7 @@ func (l *loop) wsCtrl(c *connCore, op byte, payload []byte) error {
 		// **先关闭再回帧**：closeLocal 在 outbound 锁内置 closing，之后并发的
 		// Send 一律失败，回帧才可能是 FIFO 的最后一段。反过来（先入队回帧、
 		// 再关闭）中间的 Send 会排到 close 帧后面，违反 W13。
-		// 回帧本身由 onDrain 钩子用 force 路径追加。
+		// 回帧本身由 onDrain 钩子经 appendClosingFrame 追加。
 		// 正常关闭翻译成 ErrPeerClosed——不是错误，不该刷 warn 日志（05）。
 		l.closeLocal(c, ErrPeerClosed)
 		return errWSStop

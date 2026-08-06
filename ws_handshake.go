@@ -114,7 +114,7 @@ func buildHTTPError(status int, reason string) []byte {
 // wsReject 排入 HTTP 错误响应并关闭（06 迁移表：Handshaking + 拒绝 →
 // Draining，出站链里放 HTTP 错误响应；连接未 Open 过，不会调 OnClose）。
 func (l *loop) wsReject(c *connCore, status int, reason string, cause error) {
-	_ = c.out.sendRaw(buildHTTPError(status, reason), false)
+	_ = c.out.sendRaw(buildHTTPError(status, reason))
 	l.closeLocal(c, cause)
 	l.flushBatchEnd(c)
 }
@@ -191,7 +191,7 @@ func (l *loop) wsHsReadable(c *connCore, opts *WebSocketOptions, done func(hs *H
 
 		// 接受：101 完整排入出站链 → Open → OnOpen → 处理剩余入站字节（W3）。
 		// 握手期的解析状态（carry、req、闭包）在本函数返回时全部释放（W9）。
-		_ = c.out.sendRaw(build101(key), false)
+		_ = c.out.sendRaw(build101(key))
 		carry := c.in.carry
 		c.in.carry = nil
 		c.in.syncPending(l.stats)

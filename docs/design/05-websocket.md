@@ -54,7 +54,10 @@ WebSocket：
 // 内部接口。裸 TCP 的实现是恒等变换。
 type inbound interface {
 	// feed 把本轮读到的原始字节转换成若干段 gate 字节流，逐段调用 emit。
-	// emit 返回 error 表示上层要求停止（暂停 / 关闭 / 协议错误）。
+	// emit 返回 error 表示上层要求停止——**只有关闭与协议错误**，暂停不在此列。
+	// 暂停时 gate 层把字节收进 carry（MaxPending 封顶），feed 继续推进：
+	// 已经消费掉的原始字节回退不了，中途放手会让 maskOff 相位与 WS 帧边界
+	// 一起错位。
 	feed(raw []byte, emit func(payload []byte) error) error
 }
 ```

@@ -79,7 +79,7 @@ stage 1 不是单一的消息数组，而是一个 **tagged union**——`SetCip
 
 ```go
 type stage1Item struct {
-	kind itemKind // itemMessage | itemFrame | itemCipherBarrier
+	kind itemKind // itemMessage | itemFrame | itemCipherBarrier | itemRaw
 	// itemMessage
 	data                    []byte
 	maskPermit, maskAlready byte
@@ -89,6 +89,10 @@ type stage1Item struct {
 	cipher Cipher
 }
 ```
+
+`itemRaw` 是已经是最终线路字节的原始段（WS 的 101 响应、HTTP 拒绝、WS 控制帧）：
+它绕过 gate 编码与 WS 封帧，但**仍走同一条 FIFO**——close 帧因此在结构上不可能
+插进半个数据帧中间，也不可能被后来的数据帧越过（W13）。它复用 `data` 字段。
 
 | 来源 | 载荷 |
 | --- | --- |

@@ -240,6 +240,31 @@ func (o *outbound) enqueueLocked(it stage1Item) (wake bool) {
 	return false
 }
 
+// enqueueUnlock 入队 → 解锁 → 按需唤醒。进入时持有 o.mu，返回时已释放。
+func (o *outbound) enqueueUnlock(it stage1Item) {
+	wake := o.enqueueLocked(it)
+	o.mu.Unlock()
+	if wake {
+		o.loop.maybeNotify()
+	}
+}
+
+// commitAccepted 是「一条业务消息被接受」的**唯一**提交点：记统计后走
+// enqueueUnlock。进入时持有 o.mu 且已完成准入扣减，返回时锁已释放。
+//
+// rawLen 是**逻辑原始长度**（BytesOutRaw 的口径，也是压缩率的分母）：
+// Send 传 len(b)、SendFunc 传实际填充的 k、SendFrame 传 Frame.raw——预编码帧的
+// wire 已经压过，拿它当分母会把压缩率算成 1。
+//
+// 三个 API 曾经各写一遍这两个计数，其中 SendFrame 那份还写在入队之前，
+// 于是「什么算被接受」散在三处；这一轮修复里已经有两条路径漏记过、
+// 一条用错了口径。
+func (o *outbound) commitAccepted(it stage1Item, rawLen int) {
+	o.env.stats.messagesOut.Add(1)
+	o.env.stats.bytesOutRaw.Add(uint64(rawLen))
+	o.enqueueUnlock(it)
+}
+
 // send 复制 b 入队。permit 记允许 gate 做哪些加工：Send 是 z|c|e，SendAlone 是 e
 // （只关压缩与合包，不关加密——没有任何接口能绕过连接的 Cipher）。
 func (o *outbound) send(b []byte, permit byte) error {
@@ -261,13 +286,7 @@ func (o *outbound) send(b []byte, permit byte) error {
 	// 的窗口；memcpy 的量已被 maxMessage 封顶，且分级池取放无锁。
 	data := poolGet(len(b))
 	copy(data, b)
-	wake := o.enqueueLocked(stage1Item{kind: itemMessage, data: data, maskPermit: permit})
-	o.mu.Unlock()
-	o.env.stats.messagesOut.Add(1)
-	o.env.stats.bytesOutRaw.Add(uint64(len(b)))
-	if wake {
-		o.loop.maybeNotify()
-	}
+	o.commitAccepted(stage1Item{kind: itemMessage, data: data, maskPermit: permit}, len(b))
 	return nil
 }
 
@@ -289,13 +308,7 @@ func (o *outbound) sendFrame(f *Frame) error {
 		o.env.stats.sendQueueFull.Add(1)
 		return ErrSendQueueFull
 	}
-	o.env.stats.messagesOut.Add(1)
-	o.env.stats.bytesOutRaw.Add(uint64(f.raw)) // 压缩率的分母是原始 payload
-	wake := o.enqueueLocked(stage1Item{kind: itemFrame, frame: f})
-	o.mu.Unlock()
-	if wake {
-		o.loop.maybeNotify()
-	}
+	o.commitAccepted(stage1Item{kind: itemFrame, frame: f}, f.raw)
 	return nil
 }
 
@@ -376,13 +389,7 @@ func (o *outbound) sendFunc(n int, fill func([]byte) (int, error)) error {
 	} else {
 		o.refundLocked(-delta)
 	}
-	wake := o.enqueueLocked(stage1Item{kind: itemMessage, data: buf[:k], maskPermit: flagZ | flagC | flagE})
-	o.mu.Unlock()
-	o.env.stats.messagesOut.Add(1)
-	o.env.stats.bytesOutRaw.Add(uint64(k))
-	if wake {
-		o.loop.maybeNotify()
-	}
+	o.commitAccepted(stage1Item{kind: itemMessage, data: buf[:k], maskPermit: flagZ | flagC | flagE}, k)
 	return nil
 }
 
@@ -396,34 +403,48 @@ func safeFill(fill func([]byte) (int, error), buf []byte) (k int, err error) {
 	return fill(buf)
 }
 
-// sendRaw 入队一段已是最终线路字节的原始数据（loop 线程或握手路径调用；
-// 复制入池）。charge 精确等于长度，无 slack——它不参与任何封装。
+// sendRaw 入队一段已是最终线路字节的原始数据（101 响应、HTTP 拒绝、WS 控制帧；
+// loop 线程或握手路径调用，复制入池）。charge 精确等于长度，无 slack——
+// 它不参与任何封装。
 //
-// force = true 用于**关闭已仲裁之后**追加的收尾帧（WS close 帧）：此刻
-// closing 已置位，业务数据再也进不来，所以强行追加的这一段结构上必然是
-// FIFO 的最后一段——close 帧绝不可能插进半个数据帧中间，也绝不可能被
-// 后来的数据帧越过（W13）。它同时豁免 MaxBuffer 准入：一个 ≤127 字节的
-// 收尾帧不值得为它放弃可解释的关闭码。
-func (o *outbound) sendRaw(b []byte, force bool) error {
+// 控制帧也吃准入：否则 ping 洪水可以无限堆 pong。
+func (o *outbound) sendRaw(b []byte) error {
 	o.mu.Lock()
-	if o.closing && !force {
+	if o.closing {
 		o.mu.Unlock()
 		return ErrConnClosed
 	}
-	if force {
-		o.forceChargeLocked(len(b)) // 豁免准入，但账要平
-	} else if !o.admitLocked(len(b)) {
+	if !o.admitLocked(len(b)) {
 		o.mu.Unlock()
 		o.env.stats.sendQueueFull.Add(1)
-		return ErrSendQueueFull // 控制帧也吃准入：否则 ping 洪水可无限堆 pong
+		return ErrSendQueueFull
 	}
+	return o.appendRawLocked(b)
+}
+
+// appendClosingFrame 追加**关闭已仲裁之后**的收尾帧（WS close 帧）。
+//
+// 它豁免两样东西，而这两样恰恰因为「关闭已经仲裁完」才是安全的，所以是一个
+// 方法而不是 sendRaw 的一个 force 布尔——布尔不会告诉调用方它凭什么可以传 true：
+//
+//   - 豁免 closing 闸：此刻 closing 已由 beginClose 置位，业务数据再也进不来，
+//     强行追加的这一段结构上必然是 FIFO 的最后一段——close 帧绝不可能插进半个
+//     数据帧中间，也绝不可能被后来的数据帧越过（W13）。**在 closing 置位之前
+//     调用它就没有这个保证**。
+//   - 豁免 MaxBuffer 准入：一个 ≤127 字节的收尾帧不值得为它放弃可解释的关闭码。
+//     账仍然要平——forceChargeLocked 的 borrow 与之后的 release 严格对称。
+func (o *outbound) appendClosingFrame(b []byte) error {
+	o.mu.Lock()
+	o.forceChargeLocked(len(b))
+	return o.appendRawLocked(b)
+}
+
+// appendRawLocked 完成 sendRaw / appendClosingFrame 共同的后半段：
+// 复制入池、入队、解锁、按需唤醒。进入时必须持有 o.mu 且已完成扣减。
+func (o *outbound) appendRawLocked(b []byte) error {
 	data := poolGet(len(b))
 	copy(data, b)
-	wake := o.enqueueLocked(stage1Item{kind: itemRaw, data: data})
-	o.mu.Unlock()
-	if wake {
-		o.loop.maybeNotify()
-	}
+	o.enqueueUnlock(stage1Item{kind: itemRaw, data: data})
 	return nil
 }
 
@@ -436,11 +457,7 @@ func (o *outbound) setCipher(ci Cipher) {
 		return
 	}
 	o.tailCipher = ci
-	wake := o.enqueueLocked(stage1Item{kind: itemCipherBarrier, cipher: ci})
-	o.mu.Unlock()
-	if wake {
-		o.loop.maybeNotify()
-	}
+	o.enqueueUnlock(stage1Item{kind: itemCipherBarrier, cipher: ci})
 }
 
 // isWritable 实现 Conn.Writable()：积压未越过高水位且未关闭。
@@ -496,6 +513,24 @@ func (o *outbound) recycleQ1(items []stage1Item) {
 	}
 	o.mu.Unlock()
 }
+
+// flush 的三个入口。两个布尔的合法组合只有三种，而相邻的布尔参数只能靠记忆
+// 分辨——给每种组合一个名字，调用点就不必知道它们的存在了。
+//
+//	flushDirty  消费 dirty 链上的节点：节点已出链，清 armed
+//	flushBatch  入站批收尾：清 inLoop（批内的 Send 不唤醒，全靠这一次收尾）
+//	flushNow    就地推进一次（进入 Draining 时）：两个成员资格都不动
+
+// flushDirty 消费 dirty 链上的这个节点。
+func (o *outbound) flushDirty() writeStatus { return o.flush(true, false) }
+
+// flushBatch 结束一个入站批。**任何置 inLoop 的路径都必须用 defer 兜住它**
+// （O14 第二条）：漏掉一次，inLoop 永远为 true，此后跨 goroutine 的 Send
+// 不再 arm/notify，消息会一直挂到某个无关事件把这条连接叫醒为止。
+func (o *outbound) flushBatch() writeStatus { return o.flush(false, true) }
+
+// flushNow 就地推进一次，不改动 dirty / inLoop 的成员资格。
+func (o *outbound) flushNow() writeStatus { return o.flush(false, false) }
 
 // flush：编码 stage 1 → 追加 stage 2 → 写。幂等，队列空就只推进写（O10）。
 func (o *outbound) flush(clearArmed, clearInLoop bool) writeStatus {

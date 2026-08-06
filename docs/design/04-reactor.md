@@ -431,8 +431,13 @@ type slot struct {   // 64 位上 16 字节（指针 + uint32 + padding）
 
 ```
 任何阶段决定关闭:
-    if !c.closing.swap(true):     ← 幂等，第一个 reason 生效
-        记录 reason；停止入站投递；停止接受新消息入队
+    在出站锁的**同一个临界区**内: 若 closing 已置位 → 返回（已有关闭者）
+                                  否则置 closing + 记录 reason
+        ↑ 这两步不能拆开。拆成「CAS 一个原子量」+「稍后记 reason」时，抢到
+          CAS 的那个可能被抢占，让 CAS 失败的那个先写进 reason，胜负颠倒；
+          而 Send 检查的就是这把锁下的 closing，D15「Close 返回之后 Send 一定
+          报错」也随之失守。见 06 的线性化点总表。
+        停止入站投递；停止接受新消息入队
         若 WS 且 reason 可发 close 帧 → close 帧排进出站链尾（见 05）
         进入 Draining：尝试写一次，挂进 linger 链
         ← 之后只在「可写事件」或「CloseLinger 到期」时再动，不空转
