@@ -580,3 +580,47 @@ func newHarnessNoOpen(t *testing.T) *harness {
 	h.c = c
 	return h
 }
+
+// FuzzGateCarrySplit（07 L1 第五个目标）：同一合法 gate 字节流按任意位置
+// 切两段跨读事件喂，投递序列必须与一次性喂一致；含空帧不卡 carry。
+func FuzzGateCarrySplit(f *testing.F) {
+	f.Add([]byte("\x00\x05hello\x00\x00"), uint16(3))
+	f.Add([]byte("\x01\x00xyz"), uint16(1))
+	f.Fuzz(func(t *testing.T, raw []byte, cutRaw uint16) {
+		msgs := takeMsgs(raw)
+		if len(msgs) == 0 || len(msgs) > 8 {
+			return
+		}
+		var stream []byte
+		for _, m := range msgs {
+			if len(m) > 4<<10 {
+				return
+			}
+			bf, err := buildFrame(append([]byte(nil), m...), 0, nil, false, nil, maxMessageSize)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream = append(stream, wire(&bf)...)
+		}
+		cut := int(cutRaw) % (len(stream) + 1)
+
+		h := newHarness(t)
+		if cut == 0 || cut == len(stream) {
+			h.io.feed(stream)
+		} else {
+			h.io.feed(stream[:cut], stream[cut:])
+		}
+		h.readable()
+		if len(h.msgs) != len(msgs) {
+			t.Fatalf("cut=%d: %d msgs, want %d", cut, len(h.msgs), len(msgs))
+		}
+		for i := range msgs {
+			if !bytes.Equal(h.msgs[i], msgs[i]) {
+				t.Fatalf("cut=%d: 第 %d 条不一致", cut, i)
+			}
+		}
+		h.c.requestClose(nil)
+		h.l.step()
+		h.verifyConservation()
+	})
+}
