@@ -134,10 +134,7 @@ func Listen[S any](opts Options[S]) (*Server[S], error) {
 	for i := range nloops {
 		p, err := newPoller()
 		if err != nil {
-			s.closeListeners()
-			for _, l := range s.loops {
-				_ = l.p.close()
-			}
+			s.closeStartupResources()
 			return nil, err
 		}
 		l := newLoop(p, sysIO{}, monotonicNow(), cfg, encOpts)
@@ -162,10 +159,7 @@ func Listen[S any](opts Options[S]) (*Server[S], error) {
 		}
 		l.listener = lfd
 		if err := l.p.add(lfd, makeToken(tokListener, 0, uint32(lfd)), interestRead); err != nil {
-			s.closeListeners()
-			for _, l := range s.loops {
-				_ = l.p.close()
-			}
+			s.closeStartupResources()
 			return nil, err
 		}
 	}
@@ -344,6 +338,19 @@ func (s *Server[S]) waitFor(cond func() bool) bool {
 		time.Sleep(2 * time.Millisecond)
 	}
 	return cond()
+}
+
+// closeStartupResources releases resources before any loop goroutine starts.
+// In particular, failed poller creation must not leak earlier loops' reserve fds.
+func (s *Server[S]) closeStartupResources() {
+	s.closeListeners()
+	for _, l := range s.loops {
+		if l.reserveFd >= 0 {
+			_ = unix.Close(l.reserveFd)
+			l.reserveFd = -1
+		}
+		_ = l.p.close()
+	}
 }
 
 func (s *Server[S]) closeListeners() {

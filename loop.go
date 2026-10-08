@@ -345,7 +345,7 @@ func (l *loop) step() {
 				continue // 陈旧事件（R5）
 			}
 			c := s.c
-			if e.write || (e.hup && c.state == stateDraining) {
+			if e.write || (e.hup && c.curInterest&interestWrite != 0) {
 				l.connWritable(c) // 先写后读（R14）：先还欠下的字节
 			}
 			if e.read && s.c == c && c.state < stateDraining {
@@ -406,7 +406,9 @@ func (l *loop) processInbox() {
 }
 
 func (l *loop) nextTimeout() time.Duration {
-	if l.truncated || l.boxBacklog != nil || len(l.carryQ) > 0 {
+	// 通知可能在旧 backlog 处理期间被合并并消费；新入队的闭包仍须
+	// 保证下一轮不阻塞，不能只检查已摘出的 backlog。
+	if l.truncated || l.boxBacklog != nil || l.box.head.Load() != nil || len(l.carryQ) > 0 {
 		return 0
 	}
 	var dl int64

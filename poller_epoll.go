@@ -48,13 +48,18 @@ func unpackToken(ev *unix.EpollEvent) token {
 }
 
 func epollEvents(want interest) uint32 {
-	// EPOLLRDHUP 常开：对端半关也要报出来（hup 只是提示，仍走一次 read 拿原因）。
-	ev := uint32(unix.EPOLLRDHUP)
+	// 半关闭属于读事件：Pause / Draining 时不能持续唤醒 loop。
+	var ev uint32
 	if want&interestRead != 0 {
-		ev |= unix.EPOLLIN
+		ev |= unix.EPOLLIN | unix.EPOLLRDHUP
 	}
 	if want&interestWrite != 0 {
 		ev |= unix.EPOLLOUT
+	}
+	if want == 0 {
+		// EPOLLHUP/ERR 无法屏蔽。无读写兴趣时只接收一次，避免暂停期间
+		// 忙轮询；恢复读或新增写兴趣的 MOD 会重新武装。
+		ev |= unix.EPOLLONESHOT
 	}
 	return ev
 }
@@ -101,7 +106,7 @@ func (p *epollPoller) wait(out []event, timeout time.Duration) (int, error) {
 		}
 		out[cnt] = event{
 			tok:   tok,
-			read:  kev.Events&(unix.EPOLLIN|unix.EPOLLRDHUP) != 0,
+			read:  kev.Events&(unix.EPOLLIN|unix.EPOLLRDHUP|unix.EPOLLHUP|unix.EPOLLERR) != 0,
 			write: kev.Events&unix.EPOLLOUT != 0,
 			hup:   kev.Events&(unix.EPOLLHUP|unix.EPOLLERR|unix.EPOLLRDHUP) != 0,
 		}

@@ -414,7 +414,11 @@ func TestE2E_MaxConnsRejects(t *testing.T) {
 	_ = c3.SetReadDeadline(time.Now().Add(3 * time.Second))
 	if _, err := c3.Read(make([]byte, 1)); err == nil {
 		t.Fatal("第 3 条连接应被 accept 后立即关闭（明确拒绝）")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("第 3 条连接没有及时被拒绝: %v", err)
 	}
+	// Close 先于计数器递增，对端观察到 EOF 不代表 loop 已执行完这一轮。
+	waitCond(t, func() bool { return env.srv.Stats().ConnsRejected >= 1 })
 	if got := env.srv.Stats().ConnsRejected; got < 1 {
 		t.Fatalf("ConnsRejected=%d", got)
 	}
