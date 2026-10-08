@@ -70,7 +70,11 @@ func (p *epollPoller) mod(fd int, tok token, want interest) error {
 }
 
 func (p *epollPoller) del(fd int) error {
-	return unix.EpollCtl(p.ep, unix.EPOLL_CTL_DEL, fd, nil)
+	err := unix.EpollCtl(p.ep, unix.EPOLL_CTL_DEL, fd, nil)
+	if errors.Is(err, unix.ENOENT) {
+		return nil // 与 kqueue 一致：已摘除的 fd 重复删除是幂等操作。
+	}
+	return err
 }
 
 func (p *epollPoller) wait(out []event, timeout time.Duration) (int, error) {

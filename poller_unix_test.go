@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build darwin || linux
 
 package gate
 
@@ -65,7 +65,7 @@ func TestPoller_ReadEvent(t *testing.T) {
 }
 
 // R14：同一 fd 读写同时就绪，wait 必须聚合成一个 event。
-func TestR14_KqueueAggregatesReadWrite(t *testing.T) {
+func TestR14_PollerAggregatesReadWrite(t *testing.T) {
 	p := newTestPoller(t)
 	a, b := socketPair(t)
 	tok := makeToken(tokConn, 1, 1)
@@ -147,7 +147,7 @@ func TestPoller_NotifyWakesBlockedWait(t *testing.T) {
 	if len(evs) != 1 || evs[0].tok.kind() != tokNotify {
 		t.Fatalf("evs=%+v", evs)
 	}
-	// EV_CLEAR：送达即复位。
+	// 通知送达后复位（kqueue EV_CLEAR / epoll eventfd 读取清计数）。
 	if evs := waitOne(t, p, 20*time.Millisecond); len(evs) != 0 {
 		t.Fatalf("notify 事件未复位: %+v", evs)
 	}
