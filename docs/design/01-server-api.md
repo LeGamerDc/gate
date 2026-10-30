@@ -593,7 +593,7 @@ per-connection 独立密钥和「编码一次分发多次」在根本上不兼�
 
 - **返回 `nil` 的 `Send` 绝不泄漏内存。** 那块池化缓冲要么被写上线路，要么在拆连接时
   被回收，没有第三种结局。
-- **`OnClose` 至多被调用一次**，且在业务归还暂停令牌、进程仍存活时**恰好**一次。
+- **`OnClose` 至多被调用一次**，且在在途 `AsyncDo` 已结束、进程仍存活时**恰好**一次。
   `Close` 可以重复调用，第一次的 `reason` 生效。推迟的情形见
   [阻塞任务的代价](#代价)。
 
@@ -815,7 +815,7 @@ func (h *handler) OnMessage(c *gate.Conn[*player], msg []byte) error {
   立刻回收，但业务泄漏一个 goroutine 就会跟着泄漏一个 `Conn`。
 - **`Shutdown` 不等待在途的 `AsyncDo`**。那些连接的 `OnClose` 会在各自的 `f` 结束后
   才触发；进程先退出的话就不触发了。所以准确表述是：**`OnClose` 至多调用一次；
-  业务归还了暂停令牌且进程仍存活时，恰好一次。**
+  在途 `AsyncDo` 已结束且进程仍存活时，恰好一次。**
 
 ### `Pause`：不带保证的低级原语
 
@@ -829,6 +829,8 @@ go myPool.Submit(func() {
 
 `Pause` 只做一件事：暂停这条连接的串行域。它**不提供** `AsyncDo` 的独占保证——
 执行体由业务自己提供，gate 无从知道它何时开始、是否与别的东西重叠。
+关闭不等待手动 `Pause` 的 `resume`；`OnClose` 只等待在途 `AsyncDo` 结束。
+业务自己的 worker pool 任务不能依赖 `Pause` 延长 `State` 的生命周期。
 
 用它的理由只有一个：**业务想用自己的 worker pool**（限流、复用 goroutine、带 tracing
 的执行器），而不是每次 `AsyncDo` 起一个新 goroutine。这种场景下 `State` 的串行性由
@@ -1432,7 +1434,7 @@ type Stats struct {
 	ConnsOpen        int64  // 当前
 	ConnsHandshaking int64  // 当前处于握手阶段
 	ConnsPaused      int64  // 当前被 Pause
-	ConnsOverHighWater int64 // 当前 Writable() == false
+	ConnsOverHighWater int64 // reservedWire 超高水位；含 detached 但 fill 尚未完成的连接
 	ConnsAccepted    uint64 // 累计
 	ConnsRejected    uint64
 
@@ -1445,7 +1447,7 @@ type Stats struct {
 	FramesOut   uint64 // 线路帧数
 
 	// 资源水位
-	OutboundQueued int64  // 当前出站积压总字节
+	OutboundQueued int64  // 队列 + 在途 SendFunc fill 预留（即使连接已 detach）
 	PendingInbound int64  // 当前入站残片总字节
 	PoolMiss       uint64 // 分级池取不到、走了新分配
 
@@ -1742,7 +1744,7 @@ batch 样本上实测 Fastest 比 Better 快 24% 且压缩率相同，而常驻�
 
 **代价。** `Conn` 与 `State` 活到 `f` 结束；`Shutdown` 不等待在途的 `AsyncDo`，
 那些连接的 `OnClose` 推迟触发甚至不触发（进程先退出时）。因此
-「`OnClose` 恰好一次」被精确成「至多一次；归还了暂停令牌且进程存活时恰好一次」。
+「`OnClose` 恰好一次」被精确成「至多一次；在途 `AsyncDo` 已结束且进程存活时恰好一次」。
 
 **`Pause` 保持为不带保证的低级原语**：执行体由业务提供，gate 排不了序。
 它存在的理由是让业务能用自己的 worker pool。

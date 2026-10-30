@@ -241,19 +241,19 @@ func (l *loop) resumeOnLoop(c *connCore) {
 	if c.pauseDepth > 0 {
 		c.pauseDepth--
 	}
-	if c.pauseDepth > 0 {
-		return // 还有别的 Pause 压着
-	}
-	c.exitPaused(l) // 幂等：detach 可能已经结过账
-
 	if c.state >= stateDetached {
-		// 拆除之后才到达的 resume（典型是在途 AsyncDo 结束）：
-		// 资源都已归还，它唯一还要做的事就是解锁 pendingClose。
+		// 关闭只等待仍占有串行域的 AsyncDo。手动 Pause 只是读闸，
+		// 不提供独占保证，也不能让已结束的异步任务拖住 OnClose / Wait。
+		c.exitPaused(l) // detach 已结账；晚到的 resume 幂等
 		if c.pendingClose && !c.asyncBusy {
 			l.finishClose(c)
 		}
 		return
 	}
+	if c.pauseDepth > 0 {
+		return // 仍然 Open / Draining：还有别的 Pause 压着
+	}
+	c.exitPaused(l)
 
 	// 串行域按序恢复：放出暂停期间排队的 Post 闭包（仅 Open；Draining 起丢弃）。
 	// 逐个弹出而不是 range 一份快照——闭包里可以再次 Pause / AsyncDo，

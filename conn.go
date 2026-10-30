@@ -166,6 +166,7 @@ func (c *Conn[S]) AsyncDo(f func()) error {
 }
 
 // Pause 低级原语：只暂停入站，不提供独占保证。
+// 连接关闭后不会等待手动 Pause 的 resume；OnClose 只等待在途 AsyncDo。
 // 返回的 resume 幂等、可从任意 goroutine 调用。
 //
 // **只能在事件循环线程上调用**（回调与 Post 的函数体）：它会改读闸深度、
