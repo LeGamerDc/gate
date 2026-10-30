@@ -13,8 +13,9 @@ type Stats struct {
 	ConnsOpen        int64 // 当前
 	ConnsHandshaking int64 // 当前处于握手阶段（WebSocket / PROXY）
 	ConnsPaused      int64 // 当前被 Pause
-	// ConnsOverHighWater 是当前 Writable() == false 的连接数。它按**水位穿越**
-	// 的边沿维护（进出各记一次），不是读取时逐条采样——10 万连接下采样太贵。
+	// ConnsOverHighWater 是 reservedWire 超过高水位的连接数，按水位穿越
+	// 的边沿维护（进出各记一次），不是读取时逐条采样。关闭本身不是超高水位；
+	// 已 detach 的连接若仍有未返回的 SendFunc fill，可能继续计入直到退款。
 	ConnsOverHighWater int64
 	ConnsAccepted      uint64 // 累计
 	ConnsRejected      uint64
@@ -28,7 +29,9 @@ type Stats struct {
 	FramesOut   uint64 // 线路帧数
 
 	// 资源水位
-	OutboundQueued int64 // 当前出站积压总字节（reservedWire 口径）
+	// OutboundQueued 按 reservedWire 计入队列及尚未返回的 SendFunc fill 预留。
+	// 即使连接已 detach，fill 仍持有缓冲时，这份占用也会保留到 fill 返回。
+	OutboundQueued int64
 	PendingInbound int64 // 当前入站残片总字节
 	// PoolMiss 是**进程级**的：分级池被所有 server 共享，同进程起多个
 	// server 时这个数不区分来源。稳态下它应该基本不涨。

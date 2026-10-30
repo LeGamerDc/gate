@@ -111,7 +111,8 @@ type outbound struct {
 	q1           []stage1Item
 	q1spare      []stage1Item
 	tailCipher   Cipher // 队尾生效的 cipher（最后一个 barrier 之后）：charge 与 SendFrame 冲突检查用
-	reservedWire int    // 保守上界的在途线路字节（O5：一处记账）
+	reservedWire int    // 保守上界的在途线路字节（含尚未提交的 fill 预留）
+	fillReserved int    // reservedWire 中仍由锁外 SendFunc fill 持有的部分；由 fill 独占退款
 	closing      bool
 	flushable    bool // 握手完成前 false：不 arm（O11）
 	armed        bool // dirty 节点在链中
@@ -333,15 +334,18 @@ func (o *outbound) sendFunc(n int, fill func([]byte) (int, error)) error {
 		o.env.stats.sendQueueFull.Add(1)
 		return ErrSendQueueFull
 	}
+	o.fillReserved += reserved
 	o.mu.Unlock()
 	buf := poolGet(n)
 
 	// 2.【fill】锁外跑业务代码：持锁会把 Send/Close 挡在锁上，重入 Send 就是死锁。
 	k, err := safeFill(fill, buf)
 
-	// 3.【commit】重新加锁，此刻才线性化。
+	// 3.【commit】重新加锁，此刻才线性化。fill 的预留在这里移交给
+	// 队列或退款；discard 只清队列，不能提前替仍持有缓冲的 fill 退款。
+	o.mu.Lock()
+	o.fillReserved -= reserved
 	if err != nil || k < 0 || k > n {
-		o.mu.Lock()
 		o.refundLocked(reserved)
 		o.mu.Unlock()
 		poolPut(buf)
@@ -358,7 +362,6 @@ func (o *outbound) sendFunc(n int, fill func([]byte) (int, error)) error {
 			return err // fill 的 error 原样返回，消息未入队
 		}
 	}
-	o.mu.Lock()
 	if o.closing {
 		o.refundLocked(reserved)
 		o.mu.Unlock()
@@ -879,7 +882,9 @@ func (o *outbound) discard() {
 	o.closing = true
 	items := o.q1
 	o.q1, o.q1spare = nil, nil
-	o.refundLocked(o.reservedWire) // 丢弃队列：账面与配额一起清零
+	// 锁外 fill 仍然持有内存，由它完成时退款。重复 discard 也不能
+	// 提前释放这份预算，否则 fill 返回会再次退款、凭空制造全局额度。
+	o.refundLocked(o.reservedWire - o.fillReserved)
 	o.mu.Unlock()
 
 	o.releaseItems(items)

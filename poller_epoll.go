@@ -5,6 +5,7 @@ package gate
 import (
 	"encoding/binary"
 	"errors"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -14,9 +15,13 @@ import (
 // （EpollEvent 的 Fd/Pad 两个 int32 合起来就是那个 union），事件回来零查表。
 // notify 用一个常驻 eventfd。
 type epollPoller struct {
-	ep   int
-	efd  int // eventfd：notify
-	ebuf []unix.EpollEvent
+	// notify 可能来自任意 goroutine；close 必须等在途唤醒 syscall 完成，
+	// 否则 fd 被复用后，晚到的 resume / Send 会操作不属于本 poller 的 fd。
+	notifyMu sync.Mutex
+	closed   bool
+	ep       int
+	efd      int // eventfd：notify
+	ebuf     []unix.EpollEvent
 }
 
 func newPoller() (poller, error) {
@@ -116,6 +121,11 @@ func (p *epollPoller) wait(out []event, timeout time.Duration) (int, error) {
 }
 
 func (p *epollPoller) notify() error {
+	p.notifyMu.Lock()
+	defer p.notifyMu.Unlock()
+	if p.closed {
+		return nil // 事件循环已退出，晚到的唤醒是 no-op
+	}
 	var b [8]byte
 	binary.LittleEndian.PutUint64(b[:], 1)
 	_, err := unix.Write(p.efd, b[:])
@@ -126,6 +136,12 @@ func (p *epollPoller) notify() error {
 }
 
 func (p *epollPoller) close() error {
+	p.notifyMu.Lock()
+	defer p.notifyMu.Unlock()
+	if p.closed {
+		return nil
+	}
+	p.closed = true
 	_ = unix.Close(p.efd)
 	return unix.Close(p.ep)
 }

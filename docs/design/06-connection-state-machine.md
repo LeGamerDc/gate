@@ -112,8 +112,9 @@
 | 写态 | `WriteIdle` / `WriteBlocked` | `WriteBlocked` 时注册写兴趣，并进入 stall 计时 |
 | 异步 | `AsyncIdle` / `AsyncBusy` | `AsyncBusy` 时拒绝新的 `AsyncDo`（`ErrAsyncBusy`） |
 
-进入 `Draining` 时：读闸的 `Paused` 状态保留（因为它决定 `OnClose` 什么时候能调），
-写态继续工作直到排空或超时，异步状态保留。
+进入 `Draining` 时：读闸深度保留供晚到的 `resume` 配对；写态继续工作直到排空
+或超时，异步状态保留。`Detached → Closed` 只等待在途 `AsyncDo`，不等待手动
+`Pause` 令牌；手动读闸不提供业务状态独占或延长其生命周期的保证。
 
 ### 操作合法性表
 
@@ -165,7 +166,7 @@
 1. 若 WS 且 reason 属于「可以发 close 帧」的一类 → 已在进入 Draining 时排进出站链
 2. conn.core 置 nil            ← 从此所有需要活连接的方法返回 ErrConnClosed / no-op
 3. poller.del(fd) → close(fd)
-4. 丢弃 stage1 / stage2，归还全部池内存，退还预算
+4. 丢弃 stage1 / stage2，归还其池内存与预算；锁外 SendFunc fill 的缓冲及预留由 fill 完成时归还
 5. 从五条 LRU 上摘除；槽位 conn 置 nil；槽位 gen++
 6. 若 AsyncBusy → 挂进 loop 的 pendingClose 链，等 resume
    否则 → 直接进入 Detached → Closed
@@ -594,7 +595,10 @@ type Cipher interface {
 | panic | 恢复屏障接住：归还内存、退还预算，然后按 `OnMessage` panic 处理 |
 | 永不返回 | gate 不介入。它占着一块预留内存，等同于业务泄漏——`MaxPause` 管不到这里，靠业务自己的超时 |
 
-`Close` **不等待** `fill`。
+`Close` **不等待** `fill`。未提交的预留以 `fillReserved` 单独记在 `reservedWire`
+内，仍由 `fill` 持有；`discard` 只退还两级队列的占用。即使连接已经拆除，
+在途 `fill` 的预算也不能提前释放；完成时在锁内将预留移交给队列，或恰好退款
+一次。永不返回的 `fill` 会继续占用这份预算，不能因关闭连接而绕过全局上限。
 
 ### `Post` 必须同时检查 `closing`
 

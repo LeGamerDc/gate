@@ -4,6 +4,7 @@ package gate
 
 import (
 	"errors"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -22,10 +23,14 @@ import (
 // 隐患（扫描时按指针追踪）。所以这里用 fd 索引的 token 表替代 udata，
 // 事件回来仍是 O(1) 查表、零哈希。macOS 是开发测试平台，表的内存无关紧要。
 type kqPoller struct {
-	kq   int
-	toks []token         // fd → token
-	kbuf []unix.Kevent_t // 内核事件暂存；读写分报，容量按 2×out 备
-	rbuf []unix.Kevent_t // add/mod/del 的 EV_RECEIPT 回执
+	// notify 可能来自任意 goroutine；close 必须等在途唤醒 syscall 完成，
+	// 否则 fd 被复用后，晚到的 resume / Send 会操作不属于本 poller 的 fd。
+	notifyMu sync.Mutex
+	closed   bool
+	kq       int
+	toks     []token         // fd → token
+	kbuf     []unix.Kevent_t // 内核事件暂存；读写分报，容量按 2×out 备
+	rbuf     []unix.Kevent_t // add/mod/del 的 EV_RECEIPT 回执
 }
 
 func newPoller() (poller, error) {
@@ -164,6 +169,11 @@ func (p *kqPoller) wait(out []event, timeout time.Duration) (int, error) {
 }
 
 func (p *kqPoller) notify() error {
+	p.notifyMu.Lock()
+	defer p.notifyMu.Unlock()
+	if p.closed {
+		return nil // 事件循环已退出，晚到的唤醒是 no-op
+	}
 	_, err := unix.Kevent(p.kq, []unix.Kevent_t{{
 		Ident:  0,
 		Filter: unix.EVFILT_USER,
@@ -173,5 +183,11 @@ func (p *kqPoller) notify() error {
 }
 
 func (p *kqPoller) close() error {
+	p.notifyMu.Lock()
+	defer p.notifyMu.Unlock()
+	if p.closed {
+		return nil
+	}
+	p.closed = true
 	return unix.Close(p.kq)
 }
